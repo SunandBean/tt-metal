@@ -127,6 +127,8 @@ public:
                 trid,
                 noc_id_);
         } else {
+            DPRINT << "src ptr " << get_src_ptr<AddressType::NOC>(src, src_args) << " dst ptr "
+                   << get_dst_ptr<AddressType::LOCAL_L1>(dst, dst_args) << ENDL();
             noc_async_read<max_page_size, enable_noc_tracing>(
                 get_src_ptr<AddressType::NOC>(src, src_args),
                 get_dst_ptr<AddressType::LOCAL_L1>(dst, dst_args),
