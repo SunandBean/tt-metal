@@ -102,7 +102,7 @@ def _apply_swiglu(
 
 
 def expert_mlp_forward(
-    post_dispatch: ttnn.Tensor,
+    experts_input: ttnn.Tensor,
     sparsity: ttnn.Tensor,
     weights: ThroughputExpertWeights,
     config: ThroughputExpertConfig,
@@ -122,7 +122,7 @@ def expert_mlp_forward(
     tokens are actually routed, significantly reducing computation.
 
     Args:
-        post_dispatch: Dispatch output in TILE layout [1, 1, B*S, H]
+        experts_input: Dispatch output in TILE layout [1, 1, B*S, H]
         sparsity: Sparsity tensor indicating active (token_block, expert) pairs
         weights: Expert weights (w1, w2, w3 and biases)
         config: Expert configuration
@@ -140,11 +140,11 @@ def expert_mlp_forward(
     # Reshape to sparse block format for matmul
     num_tokens = batch_size * seq_len
     num_sparse_blocks = num_tokens // config.sparsity_block_size
-    expert_input = ttnn.reshape(
-        post_dispatch,
+    reshaped_expert_input = ttnn.reshape(
+        experts_input,
         shape=(1, num_sparse_blocks, config.sparsity_block_size, config.hidden_size),
     )
-    # ttnn.deallocate(post_dispatch)
+    # ttnn.deallocate(experts_input)
 
     # ==========================================================================
     # Gate/Up/Down projections with sparse matmul
@@ -156,7 +156,7 @@ def expert_mlp_forward(
 
     # Gate projection (w1): [B*S/block, block, H] x [experts, H, I] -> [B*S/block, experts, block, I]
     w1_out = ttnn.sparse_matmul(
-        expert_input,
+        reshaped_expert_input,
         weights.w1,
         sparsity=sparsity,
         memory_config=memory_config,
@@ -173,7 +173,7 @@ def expert_mlp_forward(
 
     # Up projection (w3): same shape as gate
     w3_out = ttnn.sparse_matmul(
-        expert_input,
+        reshaped_expert_input,
         weights.w3,
         sparsity=sparsity,
         memory_config=memory_config,
@@ -182,7 +182,7 @@ def expert_mlp_forward(
         is_input_b_sparse=True,
         output_tile=ttnn.Tile([config.sparsity_block_size, ttnn.TILE_SIZE]),
     )
-    ttnn.deallocate(expert_input)
+    ttnn.deallocate(reshaped_expert_input)
 
     # Add up bias
     # w3_out shape: [1, num_sparse_blocks, 1, num_experts_per_device, block_size, intermediate]
@@ -374,7 +374,7 @@ def decode_forward(
     # sparse_matmul only computes (token_block, expert) pairs where sparsity=1,
     # significantly reducing computation for sparse expert activation patterns.
     expert_output = expert_mlp_forward(
-        post_dispatch=post_dispatch,
+        experts_input=post_dispatch,
         sparsity=sparsity,
         weights=weights,
         config=config,

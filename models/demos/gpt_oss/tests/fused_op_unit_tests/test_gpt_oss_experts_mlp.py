@@ -221,7 +221,7 @@ def gpt_oss_experts_mlp_ttnn(
         Expert output tensor [experts_per_device, B, S, H] in ROW_MAJOR layout
     """
     return expert_mlp_forward(
-        post_dispatch=post_dispatch,
+        experts_input=post_dispatch,
         sparsity=sparsity,
         weights=weights,
         config=config,
@@ -909,7 +909,7 @@ def test_gpt_oss_experts_mlp_single_device(
 
     # Run TTNN implementation
     tt_output = expert_mlp_forward(
-        post_dispatch=tt_post_dispatch,
+        experts_input=tt_post_dispatch,
         sparsity=tt_sparsity,
         weights=weights,
         config=throughput_config,
