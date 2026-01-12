@@ -137,7 +137,6 @@ class TopKRouter:
                 - router_indices: Selected expert indices for each token
         """
         # Detect decode mode for L1_WIDTH_SHARDED optimization (like tt-transformers MLP)
-        breakpoint()
         is_decode_mode = hidden_states.shape[1] == 1
         # mem_config = ttnn.L1_WIDTH_SHARDED_MEMORY_CONFIG if is_decode_mode else ttnn.DRAM_MEMORY_CONFIG
         # mem_config = (
