@@ -20,3 +20,4 @@ silu
 softshrink
 softsign
 swish
+quickgelu
