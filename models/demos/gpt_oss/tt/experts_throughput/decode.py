@@ -16,82 +16,38 @@ The MoE forward pass flow is:
 
 from math import prod
 
-import torch
-
 import ttnn
 
 from .config import AllToAllCombineConfig, AllToAllDispatchConfig, ThroughputExpertConfig, ThroughputProgramConfig
 from .weights import ThroughputExpertWeights
 
 
-def save_intermediate_sparse_matmul(
-    tensor: ttnn.Tensor, mesh_device: ttnn.MeshDevice, config: ThroughputExpertConfig, num_sparse_blocks: int, name: str
-) -> None:
-    # Save tensor for debugging - need to carefully combine sparse blocks
-    # Current shape: [1, num_sparse_blocks, 1, num_experts_per_device, block_size, intermediate]
-    # Tokens are split across dim 1 (num_sparse_blocks) and dim 4 (block_size)
-    # Experts are in dim 3 (num_experts_per_device per device)
+def prepare_expert_weights(
+    topk_expert_weights: ttnn.Tensor,
+    num_experts_per_tok: int,
+    hidden_size: int,
+) -> ttnn.Tensor:
+    """Prepare routing weights for element-wise multiplication with expert outputs.
 
-    # Step 1: Squeeze the extra dim 2
-    # [1, num_sparse_blocks, 1, num_experts_per_device, block_size, intermediate]
-    # -> [1, num_sparse_blocks, num_experts_per_device, block_size, intermediate]
-    squeezed = ttnn.squeeze(tensor, 2)
-
-    # Step 2: Permute to group sparse_blocks and block_size together
-    # [1, num_sparse_blocks, num_experts_per_device, block_size, intermediate]
-    # -> [1, num_experts_per_device, num_sparse_blocks, block_size, intermediate]
-    permuted = ttnn.permute(squeezed, (0, 2, 1, 3, 4))
-
-    # Step 3: Reshape to combine sparse_blocks * block_size into tokens
-    # [1, num_experts_per_device, num_sparse_blocks, block_size, intermediate]
-    # -> [1, num_experts_per_device, num_tokens_per_device, intermediate]
-    num_tokens_per_device = num_sparse_blocks * config.sparsity_block_size
-    reshaped = ttnn.reshape(
-        permuted, (1, config.num_experts_per_device, num_tokens_per_device, config.intermediate_size)
-    )
-
-    # Step 4: Get tensors from all devices and concatenate manually
-    # Each device has: [1, num_experts_per_device, num_tokens_per_device, intermediate]
-    torch_w1_out_device0 = ttnn.to_torch(
-        reshaped,
-        mesh_composer=ttnn.ConcatMesh2dToTensor(mesh_device, dims=(-2, 0), mesh_shape=tuple(mesh_device.shape)),
-    )
-    # We only care about the first device so we can slice with [:1, :, :num_tokens_per_device, :]
-    torch_w1_out_device0 = torch_w1_out_device0[:1, :, :num_tokens_per_device, :]
-    # Now lets save the experts individually so we can easily compare with torch
-    for expert_idx in range(config.num_experts_per_device):
-        torch.save(
-            torch_w1_out_device0[:, expert_idx : expert_idx + 1, :, :],
-            f"gpt_oss_debug/{name}_tt_expert_{expert_idx}.pt",
-        )
-    ttnn.deallocate(squeezed)
-    ttnn.deallocate(permuted)
-    ttnn.deallocate(reshaped)
-
-
-def _apply_silu_mul(w1_out: ttnn.Tensor, w3_out: ttnn.Tensor, memory_config: ttnn.MemoryConfig) -> ttnn.Tensor:
-    """Apply SiLU activation and multiply: silu(w1_out) * w3_out.
-
-    This implements the standard SwiGLU activation: silu(gate) * up
+    Transforms routing weights from [B, 1, S, K] to [K, 1, B*S, H] format for
+    broadcasting with post-combine expert outputs.
 
     Args:
-        w1_out: Gate projection output [batch, experts, tokens, intermediate]
-        w3_out: Up projection output [batch, experts, tokens, intermediate]
-        memory_config: Output memory configuration
+        topk_expert_weights: Routing weights [batch_size, 1, seq_len, num_experts_per_tok]
+        num_experts_per_tok: Number of experts selected per token (K)
+        hidden_size: Hidden dimension size (H)
 
     Returns:
-        Activated tensor with same shape as inputs
+        Transformed weights tensor [K, 1, B*S, H] in TILE layout, ready for
+        element-wise multiplication with expert outputs
     """
-    # Apply SiLU to gate output
-    w1_activated = ttnn.silu(w1_out)
-    ttnn.deallocate(w1_out)
-
-    # Element-wise multiply with up projection (SwiGLU pattern)
-    result = ttnn.mul(w1_activated, w3_out, memory_config=memory_config)
-    ttnn.deallocate(w1_activated)
-    ttnn.deallocate(w3_out)
-
-    return result
+    topk_expert_weights = ttnn.reshape(topk_expert_weights, (-1, 1, 1, num_experts_per_tok))
+    topk_weights_rm = ttnn.to_layout(topk_expert_weights, ttnn.ROW_MAJOR_LAYOUT)
+    topk_weights_rm = ttnn.repeat(topk_weights_rm, ttnn.Shape((1, 1, hidden_size, 1)))
+    topk_weights_rm = ttnn.permute(topk_weights_rm, (3, 1, 0, 2))
+    topk_weights_reshaped = ttnn.to_layout(topk_weights_rm, ttnn.TILE_LAYOUT)
+    ttnn.deallocate(topk_weights_rm)
+    return topk_weights_reshaped
 
 
 def _apply_swiglu(
@@ -145,6 +101,144 @@ def _apply_swiglu(
     return result
 
 
+def expert_mlp_forward(
+    post_dispatch: ttnn.Tensor,
+    sparsity: ttnn.Tensor,
+    weights: ThroughputExpertWeights,
+    config: ThroughputExpertConfig,
+    program_config: ThroughputProgramConfig,
+    memory_config: ttnn.MemoryConfig,
+    batch_size: int,
+    seq_len: int,
+    mesh_device=None,
+    save_intermediate: bool = False,
+) -> ttnn.Tensor:
+    """Compute expert MLP forward pass with sparse matmul.
+
+    This implements the expert computation portion of MoE:
+    output = down((up + 1) * (gate * sigmoid(gate * alpha)))
+
+    Using sparse matmul to only compute (token_block, expert) pairs where
+    tokens are actually routed, significantly reducing computation.
+
+    Args:
+        post_dispatch: Dispatch output in TILE layout [1, 1, B*S, H]
+        sparsity: Sparsity tensor indicating active (token_block, expert) pairs
+        weights: Expert weights (w1, w2, w3 and biases)
+        config: Expert configuration
+        program_config: Matmul program configuration
+        memory_config: Output memory configuration
+        batch_size: Global batch size (batch_per_device * num_devices)
+        seq_len: Sequence length
+        mesh_device: TTNN mesh device (optional, for debugging)
+        save_intermediate: Whether to save intermediate tensors for debugging
+
+    Returns:
+        Expert output tensor [experts_per_device, batch_size, seq_len, hidden_size]
+        in ROW_MAJOR layout, ready for all_to_all_combine
+    """
+    # Reshape to sparse block format for matmul
+    num_tokens = batch_size * seq_len
+    num_sparse_blocks = num_tokens // config.sparsity_block_size
+    expert_input = ttnn.reshape(
+        post_dispatch,
+        shape=(1, num_sparse_blocks, config.sparsity_block_size, config.hidden_size),
+    )
+    # ttnn.deallocate(post_dispatch)
+
+    # ==========================================================================
+    # Gate/Up/Down projections with sparse matmul
+    # ==========================================================================
+    # Expert MLP: output = down((up + 1) * (gate * sigmoid(gate * alpha)))
+    #
+    # sparse_matmul only computes (token_block, expert) pairs where sparsity=1,
+    # significantly reducing computation for sparse expert activation patterns.
+
+    # Gate projection (w1): [B*S/block, block, H] x [experts, H, I] -> [B*S/block, experts, block, I]
+    w1_out = ttnn.sparse_matmul(
+        expert_input,
+        weights.w1,
+        sparsity=sparsity,
+        memory_config=memory_config,
+        program_config=program_config.get_gate_up_config(config.intermediate_size),
+        is_input_a_sparse=False,
+        is_input_b_sparse=True,
+        output_tile=ttnn.Tile([config.sparsity_block_size, ttnn.TILE_SIZE]),
+    )
+
+    # Add gate bias
+    # w1_out shape: [1, num_sparse_blocks, 1, num_experts_per_device, block_size, intermediate]
+    # Bias shape: [1, 1, 1, num_experts_per_device, 1, intermediate] - broadcasts correctly
+    w1_out = ttnn.add(w1_out, weights.w1_bias, output_tensor=w1_out)
+
+    # Up projection (w3): same shape as gate
+    w3_out = ttnn.sparse_matmul(
+        expert_input,
+        weights.w3,
+        sparsity=sparsity,
+        memory_config=memory_config,
+        program_config=program_config.get_gate_up_config(config.intermediate_size),
+        is_input_a_sparse=False,
+        is_input_b_sparse=True,
+        output_tile=ttnn.Tile([config.sparsity_block_size, ttnn.TILE_SIZE]),
+    )
+    ttnn.deallocate(expert_input)
+
+    # Add up bias
+    # w3_out shape: [1, num_sparse_blocks, 1, num_experts_per_device, block_size, intermediate]
+    # Bias shape: [1, 1, 1, num_experts_per_device, 1, intermediate] - broadcasts correctly
+    w3_out = ttnn.add(w3_out, weights.w3_bias, output_tensor=w3_out)
+
+    # SwiGLU activation: (up + 1) * (gate * sigmoid(gate * alpha))
+    activated = _apply_swiglu(w1_out, w3_out, config.alpha, config.swiglu_limit, memory_config)
+
+    # For testing standard SiLU activation instead of SwiGLU, uncomment below and comment above:
+    # activated = _apply_silu_mul(w1_out, w3_out, memory_config)
+
+    # Squeeze batch dimensions for down projection
+    # From: [1, B*S/block, experts, block, I]
+    # To: [B*S/block, experts, block, I]
+    activated = ttnn.squeeze(activated, 0)
+    activated = ttnn.squeeze(activated, 1)
+
+    # Down projection (w2): [B*S/block, experts, block, I] x [experts, I, H] -> [B*S/block, experts, block, H]
+    expert_output_sparse = ttnn.sparse_matmul(
+        activated,
+        weights.w2,
+        sparsity=sparsity,
+        memory_config=memory_config,
+        program_config=program_config.get_down_config(config.hidden_size),
+        is_input_a_sparse=True,
+        is_input_b_sparse=False,
+        output_tile=ttnn.Tile([config.sparsity_block_size, ttnn.TILE_SIZE]),
+    )
+    ttnn.deallocate(activated)
+    ttnn.deallocate(sparsity)
+
+    # Add down projection bias
+    # expert_output shape: [num_sparse_blocks, num_experts_per_device, block_size, hidden]
+    # Bias shape: [1, num_experts_per_device, 1, hidden] - broadcasts correctly after squeeze
+    # expert_output = ttnn.add(expert_output, weights.w2_bias)
+
+    # ==========================================================================
+    # Prepare expert output for ALL_TO_ALL_COMBINE
+    # ==========================================================================
+    # Reshape from sparse matmul output to format expected by combine:
+    # From: [B*S/block, experts, block, H]
+    # To: [experts_per_device, B_global, S, H] (ROW_MAJOR)
+    #
+    # Permute to get experts_per_device as first dimension (what combine expects)
+    expert_output = ttnn.permute(expert_output_sparse, (1, 0, 2, 3))
+    ttnn.deallocate(expert_output_sparse)
+    expert_output = ttnn.reshape(
+        expert_output,
+        shape=(config.num_experts_per_device, batch_size, seq_len, config.hidden_size),
+    )
+    expert_output = ttnn.to_layout(expert_output, ttnn.ROW_MAJOR_LAYOUT)
+
+    return expert_output
+
+
 def decode_forward(
     hidden_states: ttnn.Tensor,
     topk_expert_indices: ttnn.Tensor,
@@ -189,7 +283,6 @@ def decode_forward(
 
     topk_expert_indices = ttnn.reshape(topk_expert_indices, (-1, 1, 1, config.num_experts_per_tok))
     topk_expert_indices = ttnn.typecast(topk_expert_indices, dtype=ttnn.uint16)
-    topk_expert_weights = ttnn.reshape(topk_expert_weights, (-1, 1, 1, config.num_experts_per_tok))
 
     seq_len = 1  # Decode mode always has seq_len=1
     batch_size_per_device = hidden_states.shape[0]
@@ -273,17 +366,6 @@ def decode_forward(
     post_dispatch = ttnn.to_layout(post_dispatch, ttnn.TILE_LAYOUT)
     # ttnn.deallocate(dispatch_output)
 
-    # Reshape to sparse block format for matmul
-    num_tokens = batch_size * seq_len
-    num_sparse_blocks = num_tokens // config.sparsity_block_size
-    expert_input = ttnn.reshape(
-        post_dispatch,
-        shape=(1, num_sparse_blocks, config.sparsity_block_size, config.hidden_size),
-    )
-    # ttnn.deallocate(post_dispatch)
-
-    memory_config = dispatch_config.memory_config
-
     # ==========================================================================
     # STEP 5: EXPERT COMPUTATION - Gate/Up/Down projections with sparse matmul
     # ==========================================================================
@@ -291,106 +373,18 @@ def decode_forward(
     #
     # sparse_matmul only computes (token_block, expert) pairs where sparsity=1,
     # significantly reducing computation for sparse expert activation patterns.
-
-    # Gate projection (w1): [B*S/block, block, H] x [experts, H, I] -> [B*S/block, experts, block, I]
-    w1_out = ttnn.sparse_matmul(
-        expert_input,
-        weights.w1,
+    expert_output = expert_mlp_forward(
+        post_dispatch=post_dispatch,
         sparsity=sparsity,
-        memory_config=memory_config,
-        program_config=program_config.get_gate_up_config(config.intermediate_size),
-        is_input_a_sparse=False,
-        is_input_b_sparse=True,
-        output_tile=ttnn.Tile([config.sparsity_block_size, ttnn.TILE_SIZE]),
+        weights=weights,
+        config=config,
+        program_config=program_config,
+        memory_config=dispatch_config.memory_config,
+        batch_size=batch_size,
+        seq_len=seq_len,
+        mesh_device=mesh_device,
+        save_intermediate=False,
     )
-
-    # Add gate bias
-    # w1_out shape: [1, num_sparse_blocks, 1, num_experts_per_device, block_size, intermediate]
-    # Bias shape: [1, 1, 1, num_experts_per_device, 1, intermediate] - broadcasts correctly
-    w1_out = ttnn.add(w1_out, weights.w1_bias, output_tensor=w1_out)
-    save_intermediate = False
-    if save_intermediate:
-        for expert_idx in range(4):
-            torch.save(
-                ttnn.to_torch(weights.w1, mesh_composer=ttnn.ConcatMeshToTensor(mesh_device, dim=1))[
-                    :, expert_idx : expert_idx + 1, :, :
-                ],
-                f"gpt_oss_debug/gate_weights_tt_expert_{expert_idx}.pt",
-            )
-        save_intermediate_sparse_matmul(w1_out, mesh_device, config, num_sparse_blocks, "gate")
-
-    # Up projection (w3): same shape as gate
-    w3_out = ttnn.sparse_matmul(
-        expert_input,
-        weights.w3,
-        sparsity=sparsity,
-        memory_config=memory_config,
-        program_config=program_config.get_gate_up_config(config.intermediate_size),
-        is_input_a_sparse=False,
-        is_input_b_sparse=True,
-        output_tile=ttnn.Tile([config.sparsity_block_size, ttnn.TILE_SIZE]),
-    )
-    ttnn.deallocate(expert_input)
-
-    # Add up bias
-    # w3_out shape: [1, num_sparse_blocks, 1, num_experts_per_device, block_size, intermediate]
-    # Bias shape: [1, 1, 1, num_experts_per_device, 1, intermediate] - broadcasts correctly
-    w3_out = ttnn.add(w3_out, weights.w3_bias, output_tensor=w3_out)
-    if save_intermediate:
-        for expert_idx in range(4):
-            torch.save(
-                ttnn.to_torch(weights.w3, mesh_composer=ttnn.ConcatMeshToTensor(mesh_device, dim=1))[
-                    :, expert_idx : expert_idx + 1, :, :
-                ],
-                f"gpt_oss_debug/up_weights_tt_expert_{expert_idx}.pt",
-            )
-        save_intermediate_sparse_matmul(w3_out, mesh_device, config, num_sparse_blocks, "up")
-    # SwiGLU activation: (up + 1) * (gate * sigmoid(gate * alpha))
-    activated = _apply_swiglu(w1_out, w3_out, config.alpha, config.swiglu_limit, memory_config)
-
-    # For testing standard SiLU activation instead of SwiGLU, uncomment below and comment above:
-    # activated = _apply_silu_mul(w1_out, w3_out, memory_config)
-
-    # Squeeze batch dimensions for down projection
-    # From: [1, B*S/block, experts, block, I]
-    # To: [B*S/block, experts, block, I]
-    activated = ttnn.squeeze(activated, 0)
-    activated = ttnn.squeeze(activated, 1)
-
-    # Down projection (w2): [B*S/block, experts, block, I] x [experts, I, H] -> [B*S/block, experts, block, H]
-    expert_output_sparse = ttnn.sparse_matmul(
-        activated,
-        weights.w2,
-        sparsity=sparsity,
-        memory_config=memory_config,
-        program_config=program_config.get_down_config(config.hidden_size),
-        is_input_a_sparse=True,
-        is_input_b_sparse=False,
-        output_tile=ttnn.Tile([config.sparsity_block_size, ttnn.TILE_SIZE]),
-    )
-    ttnn.deallocate(activated)
-    ttnn.deallocate(sparsity)
-
-    # Add down projection bias
-    # expert_output shape: [num_sparse_blocks, num_experts_per_device, block_size, hidden]
-    # Bias shape: [1, num_experts_per_device, 1, hidden] - broadcasts correctly after squeeze
-    # expert_output = ttnn.add(expert_output, weights.w2_bias)
-
-    # ==========================================================================
-    # STEP 6: PREPARE EXPERT OUTPUT FOR ALL_TO_ALL_COMBINE
-    # ==========================================================================
-    # Reshape from sparse matmul output to format expected by combine:
-    # From: [B*S/block, experts, block, H]
-    # To: [experts_per_device, B_global, S, H] (ROW_MAJOR)
-    #
-    # Permute to get experts_per_device as first dimension (what combine expects)
-    expert_output = ttnn.permute(expert_output_sparse, (1, 0, 2, 3))
-    ttnn.deallocate(expert_output_sparse)
-    expert_output = ttnn.reshape(
-        expert_output,
-        shape=(config.num_experts_per_device, batch_size, seq_len, config.hidden_size),
-    )
-    expert_output = ttnn.to_layout(expert_output, ttnn.ROW_MAJOR_LAYOUT)
 
     # ==========================================================================
     # STEP 7: ALL_TO_ALL_COMBINE - Route expert outputs back to token positions
@@ -424,17 +418,14 @@ def decode_forward(
     # Prepare routing weights for broadcasting:
     # From: [B, 1, S, K] (original topk weights)
     # To: [K, 1, B*S, H] (matches post_combine for element-wise multiply)
-    #
-    # Steps:
-    # 1. Repeat along hidden_size dimension
-    # 2. Permute to [K, 1, B*S, H]
-    topk_weights_rm = ttnn.to_layout(topk_expert_weights, ttnn.ROW_MAJOR_LAYOUT)
-    topk_weights_rm = ttnn.repeat(topk_weights_rm, ttnn.Shape((1, 1, config.hidden_size, 1)))
-    topk_weights_rm = ttnn.permute(topk_weights_rm, (3, 1, 0, 2))
-    topk_weights_reshaped = ttnn.to_layout(topk_weights_rm, ttnn.TILE_LAYOUT)
-    ttnn.deallocate(topk_weights_rm)
+    topk_weights_reshaped = prepare_expert_weights(
+        topk_expert_weights=topk_expert_weights,
+        num_experts_per_tok=config.num_experts_per_tok,
+        hidden_size=config.hidden_size,
+    )
 
     # Weighted sum: sum_k(expert_output_k * routing_weight_k)
+    memory_config = dispatch_config.memory_config
     weighted_output = ttnn.mul(post_combine, topk_weights_reshaped, memory_config=memory_config)
     ttnn.deallocate(post_combine)
     ttnn.deallocate(topk_weights_reshaped)

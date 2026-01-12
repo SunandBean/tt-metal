@@ -2,22 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Fused op unit test for gpt_oss_experts (full decode_forward).
+Fused op unit test for gpt_oss_prepare_expert_weights.
 
-This fused op tests the entire throughput experts decode forward pass including:
-1. Tensor preparation (reshape, typecast, layout conversion)
-2. all_to_all_dispatch - Route tokens to expert devices (CCL)
-3. moe_expert_token_remap - Create sparsity pattern
-4. Expert computation - Gate/Up/Down projections with sparse matmul + SwiGLU
-5. all_to_all_combine - Route expert outputs back (CCL)
-6. Apply routing weights and reduce across experts
-7. all_reduce - Aggregate across columns (CCL)
+This fused op prepares routing weights for element-wise multiplication with expert outputs:
+1. Reshape from [B, 1, S, K] to [-1, 1, 1, K]
+2. Layout conversion to ROW_MAJOR
+3. Repeat to expand hidden dimension
+4. Permute to [K, 1, B*S, H]
+5. Layout conversion to TILE
+6. Deallocate intermediate tensor
 
-This is a decode-only fused op (seq_len=1).
-Contains CCL ops so single device test is skipped.
+This is a decode and prefill fused op (same code path for both modes).
+Does not contain CCL ops, so single device test is applicable.
 """
 
-import itertools
 import json
 import math
 import os
@@ -31,24 +29,19 @@ from loguru import logger
 import ttnn
 from models.common.utility_functions import comp_pcc, profiler
 from models.demos.gpt_oss.tests.test_factory import TestFactory
-from models.demos.gpt_oss.tt.experts_throughput.config import (
-    AllToAllCombineConfig,
-    AllToAllDispatchConfig,
-    ThroughputExpertConfig,
-    ThroughputProgramConfig,
-    create_expert_mapping_tensors,
-    create_remap_topk_mask,
-)
-from models.demos.gpt_oss.tt.experts_throughput.decode import decode_forward
-from models.demos.gpt_oss.tt.experts_throughput.weights import load_throughput_expert_weights
+from models.demos.gpt_oss.tt.experts_throughput.decode import prepare_expert_weights
 from models.perf.benchmarking_utils import BenchmarkData, BenchmarkProfiler
 from tools.tracy.process_model_log import get_latest_ops_log_filename, run_device_profiler
 
-DEVICE_PERF_ENV_VAR = "GPT_OSS_EXPERTS_DEVICE_PERF"
+# ==============================================================================
+# Constants
+# ==============================================================================
+DEVICE_PERF_ENV_VAR = "GPT_OSS_PREPARE_EXPERT_WEIGHTS_DEVICE_PERF"
 PERF_WARMUP_ITERS = 10
 PERF_MEASURE_ITERS = 100
 DEVICE_PERF_ITERS = 10
 DEVICE_PERF_MARGIN = 0.1
+
 # TODO: Set device perf targets based on measured baselines
 DEVICE_PERF_TARGETS_US = {}
 
@@ -78,92 +71,70 @@ DEVICE_PERF_TARGETS_US = {}
 # ==============================================================================
 
 
-def gpt_oss_experts_reference(
-    hidden_states: torch.Tensor,
-    router_indices: torch.Tensor,
-    routing_weights: torch.Tensor,
-    reference_experts,
+# ==============================================================================
+# PyTorch Reference Implementation
+# ==============================================================================
+def gpt_oss_prepare_expert_weights_reference(
+    topk_expert_weights: torch.Tensor,
+    num_experts_per_tok: int,
+    hidden_size: int,
 ) -> torch.Tensor:
-    """PyTorch reference implementation for gpt_oss_experts.
+    """PyTorch reference implementation for prepare_expert_weights.
 
-    Uses the HuggingFace GptOss experts module as the reference.
+    Transforms routing weights from [B, 1, S, K] to [K, 1, B*S, H] format for
+    broadcasting with post-combine expert outputs.
 
     Args:
-        hidden_states: Input tensor [batch, seq_len, hidden_size]
-        router_indices: Expert indices per token [batch * seq_len, num_experts_per_tok]
-        routing_weights: Routing weights (sparse) [batch * seq_len, num_experts]
-        reference_experts: HuggingFace GptOss experts module
+        topk_expert_weights: Routing weights [batch_size, 1, seq_len, num_experts_per_tok]
+        num_experts_per_tok: Number of experts selected per token (K)
+        hidden_size: Hidden dimension size (H)
 
     Returns:
-        Output tensor [batch, seq_len, hidden_size]
+        Transformed weights tensor [K, 1, B*S, H]
     """
-    # Convert to float32 for reference computation (HuggingFace model uses float32 weights)
-    hidden_states_fp32 = hidden_states.float()
-    routing_weights_fp32 = routing_weights.float()
-
-    with torch.no_grad():
-        output = reference_experts(
-            hidden_states_fp32,
-            router_indices=router_indices,
-            routing_weights=routing_weights_fp32,
-        )
-    return output
+    # Reshape: [B, 1, S, K] -> [B*S, 1, 1, K]
+    weights = topk_expert_weights.reshape(-1, 1, 1, num_experts_per_tok)
+    # Repeat to expand hidden dimension: [B*S, 1, 1, K] -> [B*S, 1, H, K]
+    weights = weights.repeat(1, 1, hidden_size, 1)
+    # Permute to [K, 1, B*S, H]
+    weights = weights.permute(3, 1, 0, 2)
+    return weights
 
 
-def gpt_oss_experts_ttnn(
-    hidden_states: ttnn.Tensor,
-    topk_expert_indices: ttnn.Tensor,
+# ==============================================================================
+# TTNN Implementation
+# ==============================================================================
+def gpt_oss_prepare_expert_weights_ttnn(
     topk_expert_weights: ttnn.Tensor,
-    weights,
-    config: ThroughputExpertConfig,
-    expert_mapping_tensors: ttnn.Tensor,
-    remap_topk_mask: ttnn.Tensor,
-    dispatch_config: AllToAllDispatchConfig,
-    combine_config: AllToAllCombineConfig,
-    program_config: ThroughputProgramConfig,
-    mesh_device,
+    num_experts_per_tok: int,
+    hidden_size: int,
 ) -> ttnn.Tensor:
-    """TTNN implementation for gpt_oss_experts.
+    """TTNN implementation for prepare_expert_weights.
 
-    This is the full decode_forward function from throughput experts.
+    This is exactly the prepare_expert_weights function from decode.py.
 
     Args:
-        hidden_states: Input tensor [batch_per_device, 1, seq_len, hidden_size]
-        topk_expert_indices: Expert indices [batch_per_device, 1, seq_len, k]
-        topk_expert_weights: Routing weights [batch_per_device, 1, seq_len, k]
-        weights: ThroughputExpertWeights with w1, w2, w3 and biases
-        config: ThroughputExpertConfig
-        expert_mapping_tensors: Device-to-expert mapping
-        remap_topk_mask: Mask for expert remapping
-        dispatch_config: AllToAllDispatchConfig
-        combine_config: AllToAllCombineConfig
-        program_config: ThroughputProgramConfig
-        mesh_device: TTNN mesh device
+        topk_expert_weights: Routing weights [batch_size, 1, seq_len, num_experts_per_tok]
+        num_experts_per_tok: Number of experts selected per token (K)
+        hidden_size: Hidden dimension size (H)
 
     Returns:
-        Output tensor [1, 1, batch_per_device * seq_len, hidden_size]
+        Transformed weights tensor [K, 1, B*S, H] in TILE layout
     """
-    return decode_forward(
-        hidden_states,
-        topk_expert_indices,
-        topk_expert_weights,
-        weights,
-        config,
-        expert_mapping_tensors,
-        remap_topk_mask,
-        dispatch_config,
-        combine_config,
-        program_config,
-        mesh_device,
+    return prepare_expert_weights(
+        topk_expert_weights=topk_expert_weights,
+        num_experts_per_tok=num_experts_per_tok,
+        hidden_size=hidden_size,
     )
 
 
+# ==============================================================================
+# Helper Functions
+# ==============================================================================
 def _compare_with_reference(
     tt_output: torch.Tensor,
     ref_output: torch.Tensor,
     expected_pcc: float,
-    atol: float,
-    rtol: float,
     name: str = "",
 ) -> tuple[bool, float]:
     """Compare TT output with reference, returning pass status and PCC."""
@@ -207,12 +178,12 @@ def _measure_perf_us(
         ttnn.synchronize_device(mesh_device)
 
         profiler.clear()
-        profiler.start("gpt_oss_experts_perf")
+        profiler.start("fused_op_perf")
         ttnn.execute_trace(mesh_device, trace_id, blocking=False)
         ttnn.synchronize_device(mesh_device)
-        profiler.end("gpt_oss_experts_perf", PERF_CNT=measure_iters)
+        profiler.end("fused_op_perf", PERF_CNT=measure_iters)
         ttnn.release_trace(mesh_device, trace_id)
-        return profiler.get("gpt_oss_experts_perf") * 1e6
+        return profiler.get("fused_op_perf") * 1e6
 
     # Non-trace mode
     for _ in range(warmup_iters):
@@ -221,13 +192,13 @@ def _measure_perf_us(
         ttnn.deallocate(output)
 
     profiler.clear()
-    profiler.start("gpt_oss_experts_perf")
+    profiler.start("fused_op_perf")
     for _ in range(measure_iters):
         output = op_fn()
         ttnn.synchronize_device(mesh_device)
         ttnn.deallocate(output)
-    profiler.end("gpt_oss_experts_perf", PERF_CNT=measure_iters)
-    return profiler.get("gpt_oss_experts_perf") * 1e6
+    profiler.end("fused_op_perf", PERF_CNT=measure_iters)
+    return profiler.get("fused_op_perf") * 1e6
 
 
 def _merge_device_rows_for_perf(df: pd.DataFrame) -> pd.DataFrame:
@@ -343,70 +314,35 @@ def _collect_device_perf(
         op_stats[op_code] = {
             "avg_kernel_duration_ns": sum(kernel_vals) / len(kernel_vals),
             "avg_op_to_op_latency_ns": sum(op_to_op_vals) / len(op_to_op_vals),
-            # Also track totals for proper per-iteration calculation
             "total_kernel_duration_ns": sum(kernel_vals),
             "total_op_to_op_latency_ns": sum(op_to_op_vals),
             "call_count": len(kernel_vals),
         }
 
-    # Calculate total kernel/op-to-op time across ALL ops (not just averages per op type)
-    # This gives accurate totals that match tt-perf-report stacked output
     total_kernel_ns = sum(entry["total_kernel_duration_ns"] for entry in op_stats.values())
     total_op_to_op_ns = sum(entry["total_op_to_op_latency_ns"] for entry in op_stats.values())
     return op_stats, total_kernel_ns, total_op_to_op_ns
 
 
-def _create_reference_experts_and_weights(config, num_experts):
-    """Create HuggingFace reference experts and extract weights for TTNN.
-
-    Returns both the reference experts module and a state dict compatible with
-    load_throughput_expert_weights.
-    """
-    from transformers.models.gpt_oss.modeling_gpt_oss import GptOssDecoderLayer
-
-    reference_layer = GptOssDecoderLayer(config, layer_idx=0)
-    with torch.no_grad():
-        for name, param in reference_layer.named_parameters():
-            if any(proj in name for proj in ["router", "experts", "sinks"]):
-                param.data.normal_(0, 1)
-
-    reference_experts = reference_layer.mlp.experts.eval()
-
-    # Extract weights from reference model and convert to expected format
-    # HuggingFace format: gate_up_proj [num_experts, hidden, 2*intermediate] (interleaved)
-    # down_proj [num_experts, intermediate, hidden]
-    state_dict = {
-        "gate_up_proj": reference_experts.gate_up_proj.data.clone(),
-        "gate_up_proj_bias": reference_experts.gate_up_proj_bias.data.clone(),
-        "down_proj": reference_experts.down_proj.data.clone(),
-        "down_proj_bias": reference_experts.down_proj_bias.data.clone(),
-    }
-
-    return reference_experts, state_dict
-
-
-def _run_experts_test(
+# ==============================================================================
+# Test Implementation
+# ==============================================================================
+def _run_prepare_expert_weights_test(
     mesh_device: ttnn.MeshDevice,
-    config,
     batch_size: int,
     seq_len: int,
-    hidden_size: int,
-    num_experts: int,
     num_experts_per_tok: int,
-    intermediate_size: int,
+    hidden_size: int,
     expected_pcc: float,
-    expected_atol: float,
-    expected_rtol: float,
     expected_perf_us: float,
     trace_mode: bool,
     program_cache_enabled: bool,
-    use_real_weights: bool,
     step_prefix: str,
 ):
-    """Run the full experts fused op test."""
-
-    # Determine batch per device and row sharding
+    """Run the prepare_expert_weights fused op test."""
     mesh_shape = mesh_device.shape
+
+    # Determine batch per device for row sharding
     if batch_size > 32:
         is_row_sharded = True
         assert batch_size % mesh_shape[0] == 0, "Batch size must be divisible by mesh rows"
@@ -415,146 +351,65 @@ def _run_experts_test(
         is_row_sharded = False
         batch_size_per_device = batch_size
 
-    # Create input tensors
-    hidden_states = torch.randn(batch_size, seq_len, hidden_size, dtype=torch.bfloat16)
+    # Create input tensor (topk_expert_weights)
+    # Shape: [B, 1, S, K] - routing weights from router
+    topk_weights_torch = torch.randn(batch_size, 1, seq_len, num_experts_per_tok, dtype=torch.bfloat16)
+    # Normalize weights (as they would be in real model)
+    topk_weights_torch = torch.softmax(topk_weights_torch.float(), dim=-1).to(torch.bfloat16)
 
-    # Create router indices and weights
-    router_indices = torch.zeros(batch_size * seq_len, num_experts_per_tok, dtype=torch.long)
-    routing_weights = torch.zeros(batch_size * seq_len, num_experts)
-
-    for b, s in itertools.product(range(batch_size), range(seq_len)):
-        active_experts = torch.randperm(num_experts)[:num_experts_per_tok]
-        router_indices[b * seq_len + s, :] = active_experts
-        weights = torch.rand(num_experts_per_tok)
-        weights = weights / weights.sum()
-        routing_weights[b * seq_len + s, active_experts] = weights
-
-    # Create dense topk weights for TTNN
-    topk_weights_dense = torch.tensor(
-        [[routing_weights[i, j].item() for j in b] for i, b in enumerate(router_indices)],
-        dtype=torch.bfloat16,
+    # Reference computation
+    ref_output = gpt_oss_prepare_expert_weights_reference(
+        topk_weights_torch,
+        num_experts_per_tok,
+        hidden_size,
     )
 
-    # Create reference experts and get weights (same weights for both models)
-    reference_experts, state_dict = _create_reference_experts_and_weights(config, num_experts)
-    ref_output = gpt_oss_experts_reference(hidden_states, router_indices, routing_weights, reference_experts)
-
-    # Create TTNN configs
-    num_devices = mesh_device.get_num_devices()
-    throughput_config = ThroughputExpertConfig(
-        intermediate_size=intermediate_size,
-        num_experts=num_experts,
-        hidden_size=hidden_size,
-        num_experts_per_tok=num_experts_per_tok,
-        num_devices=num_devices,
-    )
-
-    # Use DRAM_MEMORY_CONFIG for decode to avoid L1 OOM with larger models (e.g., 120b with 4 experts/device)
-    # This matches the configuration used in mlp.py
-    dispatch_config = AllToAllDispatchConfig(cluster_axis=0, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-    combine_config = AllToAllCombineConfig(cluster_axis=0, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-    program_config = ThroughputProgramConfig()
-
-    # Create expert mapping tensors
-    expert_mapping_tensors = create_expert_mapping_tensors(
-        num_devices=num_devices,
-        num_experts_per_device=throughput_config.num_experts_per_device,
-        mesh_device=mesh_device,
-    )
-
-    # Create remap topk mask (rows is dispatch dimension)
-    num_dispatch_device_rows = mesh_shape[0]  # mesh_shape is defined earlier in this function
-    remap_topk_mask = create_remap_topk_mask(
-        num_dispatch_device_rows=num_dispatch_device_rows,
-        num_experts=num_experts,
-        mesh_device=mesh_device,
-    )
-
-    # Load expert weights (same weights as reference model)
-    weights = load_throughput_expert_weights(
-        mesh_device=mesh_device,
-        config=throughput_config,
-        state_dict=state_dict,
-        weight_dtype=ttnn.bfloat16,
-    )
-
-    # Convert inputs to TTNN tensors
+    # Convert to TTNN tensor
     mesh_mapper = (
         ttnn.ShardTensor2dMesh(dims=(0, None), mesh_shape=mesh_shape, mesh_device=mesh_device)
         if is_row_sharded
         else None
     )
 
-    tt_hidden_states = ttnn.from_torch(
-        hidden_states.unsqueeze(1),  # [B, 1, S, H]
+    tt_topk_weights = ttnn.from_torch(
+        topk_weights_torch,
         device=mesh_device,
         layout=ttnn.TILE_LAYOUT,
         dtype=ttnn.bfloat16,
-        mesh_mapper=mesh_mapper,
-    )
-
-    tt_routing_weights = ttnn.from_torch(
-        topk_weights_dense.unsqueeze(1).unsqueeze(1),  # [B, 1, 1, K]
-        device=mesh_device,
-        layout=ttnn.TILE_LAYOUT,
-        dtype=ttnn.bfloat16,
-        mesh_mapper=mesh_mapper,
-    )
-
-    tt_router_indices = ttnn.from_torch(
-        router_indices.unsqueeze(1).unsqueeze(1),  # [B, 1, 1, K]
-        device=mesh_device,
-        layout=ttnn.TILE_LAYOUT,
-        dtype=ttnn.uint16,
         mesh_mapper=mesh_mapper,
     )
 
     # Run TTNN implementation
-    tt_output = gpt_oss_experts_ttnn(
-        tt_hidden_states,
-        tt_router_indices,
-        tt_routing_weights,
-        weights,
-        throughput_config,
-        expert_mapping_tensors,
-        remap_topk_mask,
-        dispatch_config,
-        combine_config,
-        program_config,
-        mesh_device,
+    tt_output = gpt_oss_prepare_expert_weights_ttnn(
+        tt_topk_weights,
+        num_experts_per_tok,
+        hidden_size,
     )
 
     # Convert output to torch
-    mesh_composer = ttnn.ConcatMesh2dToTensor(mesh_device, dims=(-2, -1), mesh_shape=tuple(mesh_shape))
-    tt_output_torch = ttnn.to_torch(tt_output, mesh_composer=mesh_composer)[..., : batch_size * seq_len, :hidden_size]
+    mesh_composer = ttnn.ConcatMesh2dToTensor(mesh_device, dims=(2, 3), mesh_shape=tuple(mesh_shape))
+    tt_output_torch = ttnn.to_torch(tt_output, mesh_composer=mesh_composer)
+    # Slice to expected dimensions
+    tt_output_torch = tt_output_torch[:num_experts_per_tok, :1, : batch_size * seq_len, :hidden_size]
 
     # Compare with reference
     passing, pcc = _compare_with_reference(
         tt_output_torch,
         ref_output,
         expected_pcc,
-        expected_atol,
-        expected_rtol,
-        "experts",
+        "prepare_expert_weights",
     )
-    assert passing, f"Experts test failed. PCC: {pcc} < {expected_pcc}"
+    assert passing, f"prepare_expert_weights test failed. PCC: {pcc} < {expected_pcc}"
 
+    # Performance measurement
     def op_fn():
-        return gpt_oss_experts_ttnn(
-            tt_hidden_states,
-            tt_router_indices,
-            tt_routing_weights,
-            weights,
-            throughput_config,
-            expert_mapping_tensors,
-            remap_topk_mask,
-            dispatch_config,
-            combine_config,
-            program_config,
-            mesh_device,
+        return gpt_oss_prepare_expert_weights_ttnn(
+            tt_topk_weights,
+            num_experts_per_tok,
+            hidden_size,
         )
 
-    # Device performance measurement mode (when env var is set)
+    # Device performance measurement mode
     if os.getenv(DEVICE_PERF_ENV_VAR) is not None:
         logger.info("Skipping e2e perf measurement during device-perf profiling.")
         from tracy import signpost
@@ -639,20 +494,17 @@ def _run_experts_test(
     return pcc
 
 
-def _skip_single_device_ccl():
-    """Skip single device test because this fused op contains CCL ops."""
-    pytest.skip(
-        "Single-device test is not applicable because gpt_oss_experts includes CCL ops "
-        "(all_to_all_dispatch, all_to_all_combine, all_reduce)."
-    )
-
-
+# ==============================================================================
+# Pytest Test Functions
+# ==============================================================================
 @pytest.mark.parametrize(
-    "mode, seq_len, expected_pcc, expected_atol, expected_rtol, expected_perf_us",
+    "mode, seq_len, expected_pcc, expected_perf_us",
     [
-        # Decode mode only - this fused op is for decode
-        # TODO: Replace expected_perf_us baselines with theoretical targets.
-        ("decode", 1, 0.998, 0.5, 0.5, 0.0),  # Measured PCC: 0.9983
+        # Decode mode (seq_len=1) - Measured PCC: 1.0
+        ("decode", 1, 0.999, 0.0),  # TODO: Set expected_perf_us based on measured baseline
+        # Prefill modes
+        ("prefill", 128, 0.999, 0.0),
+        ("prefill", 1024, 0.999, 0.0),
     ],
 )
 @pytest.mark.parametrize("use_real_weights", [False], ids=["random_weights"])
@@ -674,32 +526,25 @@ def _skip_single_device_ccl():
     ],
     indirect=True,
 )
-def test_gpt_oss_experts(
+def test_gpt_oss_prepare_expert_weights(
     mode,
     seq_len,
     expected_pcc,
-    expected_atol,
-    expected_rtol,
     expected_perf_us,
     use_real_weights,
     program_cache_enabled,
     trace_mode,
     mesh_device,
 ):
-    """Test the gpt_oss_experts fused op (full decode_forward).
+    """Test the gpt_oss_prepare_expert_weights fused op.
 
-    This tests the complete throughput experts forward pass including:
-    - Tensor preparation
-    - all_to_all_dispatch (CCL)
-    - moe_expert_token_remap
-    - Sparse matmul (gate/up/down) + SwiGLU
-    - all_to_all_combine (CCL)
-    - Routing weight application and reduction
-    - all_reduce (CCL)
+    This tests the routing weight preparation:
+    - Reshape from [B, 1, S, K] to [-1, 1, 1, K]
+    - Layout conversion to ROW_MAJOR
+    - Repeat to expand hidden dimension
+    - Permute to [K, 1, B*S, H]
+    - Layout conversion to TILE
     """
-    assert mode == "decode", "This is a decode-only fused op"
-    assert seq_len == 1, "Decode mode always has seq_len=1"
-
     if not program_cache_enabled:
         mesh_device.disable_and_clear_program_cache()
 
@@ -709,46 +554,39 @@ def test_gpt_oss_experts(
 
     # Use config values for dimensions
     hidden_size = config.hidden_size
-    num_experts = config.num_local_experts
     num_experts_per_tok = config.num_experts_per_tok
-    intermediate_size = config.intermediate_size
 
-    # Batch size - matches decode_128 test configuration
-    # In 4x8 mesh, batch 128 is distributed as 128/4 = 32 per row
-    batch_size = 128
+    # Batch size based on mode
+    batch_size = 128 if mode == "decode" else 1
 
-    # Run test
-    pcc = _run_experts_test(
+    pcc = _run_prepare_expert_weights_test(
         mesh_device,
-        config,
         batch_size,
         seq_len,
-        hidden_size,
-        num_experts,
         num_experts_per_tok,
-        intermediate_size,
+        hidden_size,
         expected_pcc,
-        expected_atol,
-        expected_rtol,
         expected_perf_us,
         trace_mode,
         program_cache_enabled,
-        use_real_weights,
-        f"gpt_oss_experts_{mode}_seq{seq_len}",
+        f"gpt_oss_prepare_expert_weights_{mode}_seq{seq_len}",
     )
 
     logger.info(f"Test passed with PCC: {pcc}")
 
 
+# ==============================================================================
+# Single Device Test
+# ==============================================================================
 @pytest.mark.parametrize(
-    "mode, seq_len, expected_pcc, expected_atol, expected_rtol, expected_perf_us",
+    "mode, seq_len, expected_pcc, expected_perf_us",
     [
-        ("decode", 1, 0.998, 0.5, 0.5, 0.0),
+        ("decode", 1, 0.999, 0.0),  # Measured PCC: 1.0
     ],
 )
 @pytest.mark.parametrize("use_real_weights", [False], ids=["random_weights"])
-@pytest.mark.parametrize("program_cache_enabled", [True, False], ids=["program_cache", "no_program_cache"])
-@pytest.mark.parametrize("trace_mode", [False, True], ids=["eager", "trace"])
+@pytest.mark.parametrize("program_cache_enabled", [True], ids=["program_cache"])
+@pytest.mark.parametrize("trace_mode", [False], ids=["eager"])
 @pytest.mark.parametrize(
     "mesh_device",
     [(4, 8)],
@@ -765,52 +603,98 @@ def test_gpt_oss_experts(
     ],
     indirect=True,
 )
-def test_gpt_oss_experts_single_device(
+def test_gpt_oss_prepare_expert_weights_single_device(
     mode,
     seq_len,
     expected_pcc,
-    expected_atol,
-    expected_rtol,
     expected_perf_us,
     use_real_weights,
     program_cache_enabled,
     trace_mode,
     mesh_device,
 ):
-    """Single device test for gpt_oss_experts.
+    """Single device test for gpt_oss_prepare_expert_weights.
 
-    This test is skipped because gpt_oss_experts contains CCL ops:
-    - all_to_all_dispatch
-    - all_to_all_combine
-    - all_reduce
+    This test can run on single device since prepare_expert_weights
+    does not contain CCL ops.
     """
-    _skip_single_device_ccl()
+    # Create a 1x1 submesh to get a single device
+    single_device_mesh = mesh_device.create_submesh(ttnn.MeshShape((1, 1)))
+
+    # Get HF config
+    setup = TestFactory.setup_test(mesh_device, use_real_weights=False)
+    config = setup["config"]
+
+    hidden_size = config.hidden_size
+    num_experts_per_tok = config.num_experts_per_tok
+    batch_size_per_device = 32  # Single device batch size (128 / 4 rows)
+
+    # Create input tensor
+    topk_weights_torch = torch.randn(batch_size_per_device, 1, seq_len, num_experts_per_tok, dtype=torch.bfloat16)
+    topk_weights_torch = torch.softmax(topk_weights_torch.float(), dim=-1).to(torch.bfloat16)
+
+    # Reference computation
+    ref_output = gpt_oss_prepare_expert_weights_reference(
+        topk_weights_torch,
+        num_experts_per_tok,
+        hidden_size,
+    )
+
+    # Convert to TTNN tensor (single device submesh)
+    tt_topk_weights = ttnn.from_torch(
+        topk_weights_torch,
+        device=single_device_mesh,
+        layout=ttnn.TILE_LAYOUT,
+        dtype=ttnn.bfloat16,
+        mesh_mapper=ttnn.ReplicateTensorToMesh(single_device_mesh),
+    )
+
+    # Run TTNN implementation
+    tt_output = gpt_oss_prepare_expert_weights_ttnn(
+        tt_topk_weights,
+        num_experts_per_tok,
+        hidden_size,
+    )
+
+    # Convert output to torch
+    tt_output_torch = ttnn.to_torch(ttnn.get_device_tensors(tt_output)[0])
+    tt_output_torch = tt_output_torch[:num_experts_per_tok, :1, : batch_size_per_device * seq_len, :hidden_size]
+
+    # Compare with reference
+    passing, pcc = _compare_with_reference(
+        tt_output_torch,
+        ref_output,
+        expected_pcc,
+        "prepare_expert_weights_single_device",
+    )
+    assert passing, f"Single device prepare_expert_weights test failed. PCC: {pcc} < {expected_pcc}"
+    logger.info(f"Single device test passed with PCC: {pcc}")
 
 
+# ==============================================================================
+# Device Performance Test
+# ==============================================================================
 @pytest.mark.parametrize(
     "mode, seq_len",
     [
         ("decode", 1),
     ],
 )
-def test_gpt_oss_experts_device_perf(mode, seq_len):
-    """Device performance test for gpt_oss_experts.
+def test_gpt_oss_prepare_expert_weights_device_perf(mode, seq_len):
+    """Device performance test for gpt_oss_prepare_expert_weights.
 
     This test measures device kernel duration and op-to-op latency using Tracy profiler.
     """
-    assert mode == "decode", "This is a decode-only fused op"
-    assert seq_len == 1, "Decode mode always has seq_len=1"
-
     # Batch size for decode_128 configuration
-    batch_size = 128
+    batch_size = 128 if mode == "decode" else 1
 
     perf_profiler = BenchmarkProfiler()
     benchmark_data = BenchmarkData()
-    step_name = f"gpt_oss_experts_device_perf_{mode}_seq{seq_len}"
-    test_path = "models/demos/gpt_oss/tests/fused_op_unit_tests/test_gpt_oss_experts.py"
+    step_name = f"gpt_oss_prepare_expert_weights_device_perf_{mode}_seq{seq_len}"
+    test_path = "models/demos/gpt_oss/tests/fused_op_unit_tests/test_gpt_oss_prepare_expert_weights.py"
     trace_filter = "trace" if mode == "decode" else "eager"
     expr = f"program_cache and not no_program_cache and {trace_filter} and {mode} and {seq_len}"
-    command = f'pytest {test_path}::test_gpt_oss_experts -k "{expr}"'
+    command = f'pytest {test_path}::test_gpt_oss_prepare_expert_weights -k "{expr}"'
 
     perf_profiler.start("run")
     perf_profiler.start(step_name)

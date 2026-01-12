@@ -5,7 +5,9 @@ The following should be provided by the user in order to complete this task succ
 - The sequence of ops that comprise the new fused op
 - The test command for the containing module of the sequence of ops
 
-Before you start, please read the example test in models/demos/gpt_oss/tests/fused_op_unit_tests/test_gpt_oss_prepare_expert_tensors.py carefully. The new test should be similar to the example test, just for a different fused op.
+Before you start, please read the example test in models/demos/gpt_oss/tests/fused_op_unit_tests/test_gpt_oss_experts.py carefully. The new test should be similar to the example test, just for a different fused op.
+
+You will need to source the python environment found in python_env/ in order to run the tests.
 
 Example test command for gpt-oss experts module:
 ```
@@ -18,6 +20,7 @@ Follow these steps to add a new fused op unit test:
     1. Find the sequence of ops in the module for decode; if it's unclear which ones should be fused, let the user know immediately.
     2. Find the sequence of ops in the module for prefill; if the same sequence of ops does not exist for prefill, then ignore all prefill instructions and inform the user in the final summary that this was a decode only fused op sequence.
 3. Create a new file for the new fused op unit test under models/demos/gpt_oss/tests/fused_op_unit_tests/test_NEW_FUSED_OP_NAME.py
+    - IMPORTANT: Create ONE file per fused op for clarity. Do not combine multiple fused ops into the same file.
 4. In the fused op unit test file, create a PyTorch reference for the newly fused op based on the sequence of ttnn ops.
 	- Make sure to use the PyTorch reference as a basis here. To figure out what reference code is used, look at the containing module's test, e.g. test_modules.py for a fused op that's contained in the experts module. Then figure out which exact portion of the reference model's code corresponds to our new fused op. It might be necessary to modify the reference code slightly to get the correct reference implementation since the exact operations used in the ttnn model and in the reference model may differ.
 	- In the fused op unit test file, create a new reference function "NEW_FUSED_OP_reference". Inputs/outputs to the function should be PyTorch tensors and function parameters of that sequence of ops; make sure to parameterize everything that's parameterized in the module as well, no hardcoding unless it is hardcoded in the model too.
@@ -34,24 +37,35 @@ Follow these steps to add a new fused op unit test:
       - If it fails due to trace_region_size being too small, set the trace_region_size pytest parameter (see example test) based on the required size as printed in the log.
     6. Contains a pytest parameter to turn program_caching on/off, this is only done when trace is off, with trace mode program_cache must be enabled too; use device.disable_and_clear_program_cache() for disabling, it's enabled by default
 	7. Compares PCC, ATOL, performance
+    8. The main test function should detect DEVICE_PERF_ENV_VAR and use tracy signposts for device perf measurement mode
 8. *Verify NEW_FUSED_OP_reference* and the test code itself by running the unit test and comparing pcc to NEW_FUSED_OP_ttnn. The PCC should typically be > 0.99, otherwise there's likely something wrong. Add the result of this including a log file in the final summary of work. Do not proceed further in the TODOs unless this passes.
 	1. Update the expected_pcc with the pcc value from the test (if it's > 0.99 otherwise, debug the test to fix it!)
 	2. Use the current perf as expected_perf but add a TODO comment to add the actual target (based on theoretical numbers)
-9. *Verify* that the fused op unit test as well as the sequence of ops within the module *use the exact same configuration including input shapes, dtype, memory_config, and buffer type*. Add the result of this including a log file in the final summary of work. Update the test configurations if there are any mismatches, do not change the sequence in the module, consider this the ground truth.
+9. Add a device performance test function `test_NEW_FUSED_OP_NAME_device_perf`:
+    - This is a SEPARATE pytest function (not just parameters) that uses Tracy profiler to measure kernel duration and op-to-op latency
+    - It should:
+      1. Define DEVICE_PERF_ENV_VAR constant for the fused op
+      2. Set the env var and call run_device_profiler with the main test command
+      3. Use _collect_device_perf helper to run the test with profiling and post-process results
+      4. Use signposts to mark measurement iterations (start/stop)
+      5. Report total_kernel_duration_us and total_op_to_op_latency_us
+      6. Add measurements to BenchmarkData for CI tracking
+    - See test_gpt_oss_experts.py::test_gpt_oss_experts_device_perf for the pattern to follow
+10. *Verify* that the fused op unit test as well as the sequence of ops within the module *use the exact same configuration including input shapes, dtype, memory_config, and buffer type*. Add the result of this including a log file in the final summary of work. Update the test configurations if there are any mismatches, do not change the sequence in the module, consider this the ground truth.
     1. Run the device perf test of the fused op unit test for prefill (shortest seqlen in fused op unit test) and decode, copy the generated csv files into a newly created folder.
     2. Run the module test with 1 iteration, both for prefill (same seqlen as in fused op unit test csv) and decode, copy the generated csv files into the same folder as in the last step.
     3. Compare for each op that all properties are identical, i.e. fused op unit test and module test match in terms of op input/output properties both for prefill and for decode. Take a look at example_compare_fused_wqkva_configs.py in models/demos/deepseek_v3/tests/fused_op_unit_tests/ to see how that was done for an example fused op unit test.
-10. Add a single device test
+11. Add a single device test
     1. Create a new pytest in the file with the same name + "_single_device"
     2. If the sequence of ops contains a CCL, skip the single device test with an appropriate skip message. The following points only affect tests that can be executed on single device
     3. The test takes the first device from the mesh_device fixture and runs the ops only on that device
     4. The input shape to the single device test is the chunk of the input from the multi device test that resides on the first device, hence the chunk that is processed but the first device. In order to find the correct shape, run the device perf test (multi device) and extract the input shape to the first op from the generated ops_perf_report, this is already the per device shape. Do the same for all matmul input_tensor_b shapes.
     5. Restructure the existing code to maintain a clean test that re-uses common parts of the code. Be very careful not to change any functionality in the existing test.
     6. Run the single device test and verify that both the PCC and the perf are the same as for the multi device test.
-11. Add a single device test for device performance, see step 10 for how to do that.
-12. If single device tests are not skipped, *verify* the single device tests by running the single device, device perf test that generated the csv file and compare it to the multi device perf csv. All shapes must match, create a helper script to verify that.
-13. Print the summary for all verification steps clearly representing the results and the links to logs for all successful verification steps.
-14. List anything that was unexpected and/or any workarounds you needed to make the fused op unit test work.
+12. Add a single device test for device performance, see step 11 for how to do that.
+13. If single device tests are not skipped, *verify* the single device tests by running the single device, device perf test that generated the csv file and compare it to the multi device perf csv. All shapes must match, create a helper script to verify that.
+14. Print the summary for all verification steps clearly representing the results and the links to logs for all successful verification steps.
+15. List anything that was unexpected and/or any workarounds you needed to make the fused op unit test work.
 
 Notes on performance measurements:
 - Performance measurements use three metrics: e2e_duration, kernel_duration, op_to_op_latency
