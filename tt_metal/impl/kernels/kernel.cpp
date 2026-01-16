@@ -530,7 +530,7 @@ void Kernel::set_runtime_args_count(CoreRangeSet& core_ranges, uint32_t count) {
                 }
 
                 TT_ASSERT(count >= core_to_runtime_args_data_[x][y].size());
-                core_to_runtime_args_data_[x][y].rt_args_count = count;
+                core_to_runtime_args_data_[x][y].rt_args_count = count - watcher_count_word_offset_;
             }
         }
     }
@@ -540,7 +540,7 @@ void Kernel::set_common_runtime_args_count(uint32_t count) {
     TT_ASSERT(count >= this->common_runtime_args_.size());
 
     this->common_runtime_args_count_ = count;
-    this->common_runtime_args_data_.rt_args_count = count;
+    this->common_runtime_args_data_.rt_args_count = count - watcher_count_word_offset_;
 }
 
 bool Kernel::is_idle_eth() const { return this->programmable_core_type_ == HalProgrammableCoreType::IDLE_ETH; }
