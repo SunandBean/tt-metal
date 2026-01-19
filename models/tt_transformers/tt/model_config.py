@@ -566,6 +566,7 @@ class ModelArgs:
                 "Qwen2.5-VL-7B": {"N150": 64, "N300": 128, "T3K": None, "TG": None, "P150x4": None},
                 "Qwen2.5-VL-32B": {"N150": None, "N300": None, "T3K": 64, "TG": None, "P150x4": None},
                 "Qwen2.5-VL-72B": {"N150": None, "N300": None, "T3K": 32, "TG": None, "P150x4": None},
+                "Qwen3-VL-32B": {"N150": None, "N300": None, "T3K": 64, "TG": None, "P150x4": None},
                 "DeepSeek-R1-Distill-Qwen-14B": {"N150": 4, "N300": 64, "T3K": 128, "TG": None, "P150x4": None},
                 "Phi-3.5-mini-instruct": {"N150": 128, "N300": 128, "T3K": 128, "TG": 128, "P150x4": 128},
                 "Phi-3-mini-128k-instruct": {"N150": 32, "N300": 64, "T3K": 128, "TG": 128, "P150x4": 128},
@@ -1711,6 +1712,7 @@ class ModelArgs:
         self.mlp_activation_type = self._get_hidden_activation_type(text_config)
 
         self._set_vision_params(config)
+        print("vision_config", config.get("vision_config", None))
         self.is_multimodal = "vision_config" in config or self.is_vision()
 
         self.state_dict_text_prefix = self._get_text_prefix()
@@ -2018,6 +2020,13 @@ class ModelArgs:
                     from transformers import Mistral3ForConditionalGeneration
 
                     model_cls = Mistral3ForConditionalGeneration
+                elif "Qwen3-VL" in self.model_name:
+                    from transformers.models.qwen3_vl.modeling_qwen3_vl import (
+                        Qwen3VLForConditionalGeneration as AutoModelForCausalLM,
+                    )
+
+                    model_cls = AutoModelForCausalLM
+                    print("Loading Qwen3-VL model: ", AutoModelForCausalLM)
                 else:
                     model_cls = self.get_hf_model_cls()
                 model = model_cls.from_pretrained(
