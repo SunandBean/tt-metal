@@ -285,7 +285,7 @@ jobs:
 
   triage-tests:
     needs: [parse-tests-json, build-artifact]
-    if: ${{ contains(needs.parse-tests-json.outputs.tests-to-run, 'triage-tests') }}
+    if: ${{ contains(needs.parse-tests-json.outputs.tests-to-run, 'triage-tests') && !inputs.enable-watcher }}
     secrets: inherit
     strategy:
       fail-fast: false
