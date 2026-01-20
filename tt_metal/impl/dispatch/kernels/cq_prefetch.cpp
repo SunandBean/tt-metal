@@ -348,23 +348,11 @@ FORCE_INLINE uint32_t read_from_pcie(
     
     // Check if we need to wrap cmddat_q
     if (fence + needed_space > cmddat_q_end) {
-        // We need to wrap. Check if there's sufficient space after wrapping.
-        // After wrapping, fence will be at cmddat_q_base, and we need space from
-        // cmddat_q_base to cmddat_q_base + needed_space.
-        // We can proceed if cmd_ptr is either:
-        // 1. Equal to fence (no unprocessed commands)
-        // 2. In the non-wrapped region (fence_old to cmddat_q_end), so wrapping is safe
-        // 3. In the wrapped region but beyond where we'll write (cmddat_q_base + needed_space to cmd_ptr)
-        
+        // We need to wrap. Conservative approach: only allow wrapping if cmd_ptr == fence
+        // (no unprocessed commands). This ensures we don't overwrite any unprocessed data.
         if (cmd_ptr != fence) {
-            // Check if cmd_ptr is in the wrapped region and would be overwritten
-            if (cmd_ptr >= cmddat_q_base && cmd_ptr < cmddat_q_base + needed_space) {
-                // cmd_ptr is in the region we'd write to after wrapping - can't proceed
-                return pending_read_size;
-            }
-            // cmd_ptr is either in the non-wrapped region (safe to wrap) or
-            // beyond our write region (safe to wrap)
-            // Proceed with wrapping
+            // Can't wrap when there are unprocessed commands
+            return pending_read_size;
         }
         fence = cmddat_q_base;
     } else {
