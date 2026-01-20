@@ -320,7 +320,7 @@ FORCE_INLINE uint32_t read_from_pcie(
             // Not enough space in circular queue so wait for reads to catch up
             noc_async_read_barrier();
             cmd_ptr = fence;
-            fence += needed_space;
+            // fence += needed_space;
         }
     }
 
