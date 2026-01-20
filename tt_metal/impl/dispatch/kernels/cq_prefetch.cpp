@@ -289,15 +289,48 @@ FORCE_INLINE void write_downstream(
     local_downstream_data_ptr += length;
 }
 
-// If prefetcher must stall after this fetch, wait for data to come back, and move to stalled state.
-FORCE_INLINE void barrier_and_stall(uint32_t& pending_read_size, uint32_t& fence, uint32_t& cmd_ptr, uint32_t trid) {
-    // Use transaction-ID-specific barrier since we know which transaction ID was used
-    noc_async_read_barrier_with_trid(trid);
-    if (fence < cmd_ptr) {
-        cmd_ptr = fence;
+// Structure to track a pending read
+struct PendingRead {
+    uint32_t trid;
+    uint32_t size;
+    uint32_t fence_before_read;  // Fence position before this read (to detect wraps)
+    bool wrapped;  // Whether this read caused a wrap
+};
+
+// Helper to wrap fence if needed
+FORCE_INLINE void wrap_fence_if_needed(uint32_t& fence) {
+    if (fence >= cmddat_q_end) {
+        fence = cmddat_q_base + (fence - cmddat_q_end);
     }
-    fence += pending_read_size;
-    pending_read_size = 0;
+}
+
+// If prefetcher must stall after this fetch, wait for data to come back, and move to stalled state.
+FORCE_INLINE void barrier_and_stall(uint32_t base_fence, uint32_t& fence, uint32_t& cmd_ptr, PendingRead* pending_reads, uint32_t num_pending) {
+    uint32_t total_pending_size = 0;
+    
+    // Wait for all pending reads to complete and handle wrap logic
+    for (uint32_t i = 0; i < num_pending; i++) {
+        noc_async_read_barrier_with_trid(pending_reads[i].trid);
+        total_pending_size += pending_reads[i].size;
+        
+        // Check if this read caused a wrap - if so, we need to update cmd_ptr correctly
+        if (pending_reads[i].wrapped) {
+            // This read wrapped. If cmd_ptr is in the non-wrapped region, it needs adjustment
+            if (cmd_ptr >= pending_reads[i].fence_before_read && cmd_ptr < cmddat_q_end) {
+                // cmd_ptr is in the region that was wrapped - it should be set to the wrapped fence
+                cmd_ptr = cmddat_q_base;
+            }
+        }
+    }
+    
+    // Standard wrap check
+    if (base_fence < cmd_ptr) {
+        cmd_ptr = base_fence;
+    }
+    
+    // Update fence to reflect all completed reads
+    fence = base_fence + total_pending_size;
+    wrap_fence_if_needed(fence);
     stall_state = STALLED;
 }
 
@@ -311,16 +344,35 @@ FORCE_INLINE uint32_t read_from_pcie(
     uint32_t& out_trid) {
     static uint32_t transaction_id = 0U;
     uint32_t pending_read_size = 0;
-    // Wrap cmddat_q
-    if (fence + size + preamble_size > cmddat_q_end) {
-        // only wrap if there are no commands ready, otherwise we'll leave some on the floor
-        // TODO: does this matter for perf?
+    const uint32_t needed_space = size + preamble_size;
+    
+    // Check if we need to wrap cmddat_q
+    if (fence + needed_space > cmddat_q_end) {
+        // We need to wrap. Check if there's sufficient space after wrapping.
+        // After wrapping, fence will be at cmddat_q_base, and we need space from
+        // cmddat_q_base to cmddat_q_base + needed_space.
+        // We can proceed if cmd_ptr is either:
+        // 1. Equal to fence (no unprocessed commands)
+        // 2. In the non-wrapped region (fence_old to cmddat_q_end), so wrapping is safe
+        // 3. In the wrapped region but beyond where we'll write (cmddat_q_base + needed_space to cmd_ptr)
+        
         if (cmd_ptr != fence) {
-            // No pending reads, since the location of fence cannot be moved due to unread commands
-            // in the cmddat_q -> reads cannot be issued to fill the queue.
-            return pending_read_size;
+            // Check if cmd_ptr is in the wrapped region and would be overwritten
+            if (cmd_ptr >= cmddat_q_base && cmd_ptr < cmddat_q_base + needed_space) {
+                // cmd_ptr is in the region we'd write to after wrapping - can't proceed
+                return pending_read_size;
+            }
+            // cmd_ptr is either in the non-wrapped region (safe to wrap) or
+            // beyond our write region (safe to wrap)
+            // Proceed with wrapping
         }
         fence = cmddat_q_base;
+    } else {
+        // No wrap needed, but check if we'd overwrite cmd_ptr in the non-wrapped case
+        if (cmd_ptr > fence && cmd_ptr < fence + needed_space) {
+            // cmd_ptr is in the region we'd write to - can't proceed
+            return pending_read_size;
+        }
     }
 
     // Wrap pcie/hugepage
@@ -351,6 +403,69 @@ FORCE_INLINE uint32_t read_from_pcie(
     return pending_read_size;
 }
 
+// Helper to issue a read and add it to pending queue
+// Note: fence is NOT advanced here - it's advanced only after reads complete
+template <uint32_t preamble_size>
+FORCE_INLINE bool issue_read_and_track(
+    volatile tt_l1_ptr prefetch_q_entry_type*& prefetch_q_rd_ptr,
+    uint32_t& current_fence,  // Current fence position (will be used for next read)
+    uint32_t& pcie_read_ptr,
+    uint32_t cmd_ptr,
+    uint32_t fetch_size,
+    PendingRead* pending_reads,
+    uint32_t& num_pending_reads,
+    uint32_t& base_fence,
+    uint32_t max_pending) {
+    
+    if (num_pending_reads >= max_pending) {
+        return false;
+    }
+    
+    // Track base fence for the first pending read
+    if (num_pending_reads == 0) {
+        base_fence = current_fence;
+    }
+    
+    // Save fence position before the read (to detect wraps)
+    uint32_t fence_before = current_fence;
+    
+    uint32_t trid;
+    uint32_t read_size = read_from_pcie<preamble_size>(
+        prefetch_q_rd_ptr, current_fence, pcie_read_ptr, cmd_ptr, fetch_size, trid);
+    
+    if (read_size == 0) {
+        return false;
+    }
+    
+    // Check if a wrap occurred
+    // A wrap occurs in read_from_pcie when fence_before + needed_space > cmddat_q_end
+    // After read_from_pcie, if a wrap occurred, current_fence will be cmddat_q_base
+    // Then we add read_size, so current_fence = cmddat_q_base + read_size
+    // Detection: if fence_before was in valid range and current_fence < fence_before (after adding read_size),
+    // or if fence_before + read_size would exceed cmddat_q_end, a wrap occurred
+    bool wrapped = false;
+    if (fence_before >= cmddat_q_base && fence_before < cmddat_q_end) {
+        // Check if the read would have caused a wrap
+        uint32_t expected_after = fence_before + read_size;
+        if (expected_after > cmddat_q_end) {
+            wrapped = true;
+        }
+    }
+    
+    // Add to pending reads queue
+    pending_reads[num_pending_reads].trid = trid;
+    pending_reads[num_pending_reads].size = read_size;
+    pending_reads[num_pending_reads].fence_before_read = fence_before;
+    pending_reads[num_pending_reads].wrapped = wrapped;
+    num_pending_reads++;
+    
+    // Advance current_fence for the next read (but don't update actual fence until reads complete)
+    current_fence += read_size;
+    wrap_fence_if_needed(current_fence);
+    
+    return true;
+}
+
 // This routine can be called in 8 states based on the boolean values cmd_ready, prefetch_q_ready, read_pending:
 //  - !cmd_ready, !prefetch_q_ready, !read_pending: stall on prefetch_q, issue read, read barrier
 //  - !cmd_ready, !prefetch_q_ready,  read pending: read barrier (and re-evaluate prefetch_q_ready)
@@ -373,14 +488,17 @@ FORCE_INLINE uint32_t read_from_pcie(
 //  -  cmd_ready,  prefetch_q_ready,  read_pending: issue and tag read
 template <uint32_t preamble_size>
 void fetch_q_get_cmds(uint32_t& fence, uint32_t& cmd_ptr, uint32_t& pcie_read_ptr) {
-    static uint32_t pending_read_size = 0;
-    static uint32_t pending_read_trid = 0;
+    // Track up to 8 outstanding reads (sufficient for pipelining)
+    constexpr uint32_t MAX_PENDING_READS = 8;
+    static PendingRead pending_reads[MAX_PENDING_READS];
+    static uint32_t num_pending_reads = 0;
+    static uint32_t base_fence = 0;  // Track where the first pending read starts
     static volatile tt_l1_ptr prefetch_q_entry_type* prefetch_q_rd_ptr =
         (volatile tt_l1_ptr prefetch_q_entry_type*)prefetch_q_base;
     constexpr uint32_t prefetch_q_msb_mask = 1u << (sizeof(prefetch_q_entry_type) * CHAR_BIT - 1);
 
     if (stall_state == STALLED) {
-        ASSERT(pending_read_size == 0);  // Before stalling, fetch must have been completed.
+        ASSERT(num_pending_reads == 0);  // Before stalling, fetch must have been completed.
         return;
     }
 
@@ -389,69 +507,108 @@ void fetch_q_get_cmds(uint32_t& fence, uint32_t& cmd_ptr, uint32_t& pcie_read_pt
         cmd_ptr = fence;
     }
 
-    bool cmd_ready = (cmd_ptr != fence);
+    // Calculate expected fence after all pending reads complete
+    uint32_t expected_fence = fence;
+    if (num_pending_reads > 0) {
+        uint32_t total_pending = 0;
+        for (uint32_t i = 0; i < num_pending_reads; i++) {
+            total_pending += pending_reads[i].size;
+        }
+        expected_fence = base_fence + total_pending;
+        wrap_fence_if_needed(expected_fence);
+    }
+    
+    // cmd_ready should be based on expected fence, not current fence
+    bool cmd_ready = (cmd_ptr != expected_fence);
 
     uint32_t prefetch_q_rd_ptr_local = *prefetch_q_rd_ptr;
     uint32_t fetch_size = (prefetch_q_rd_ptr_local & ~prefetch_q_msb_mask) << prefetch_q_log_minsize;
     bool stall_flag = (prefetch_q_rd_ptr_local & prefetch_q_msb_mask) != 0;
     stall_state = static_cast<StallState>(stall_flag << 1);  // NOT_STALLED -> STALL_NEXT if stall_flag is set
 
-    if (fetch_size != 0 && pending_read_size == 0) {
-        uint32_t trid;
-        pending_read_size = read_from_pcie<preamble_size>(prefetch_q_rd_ptr, fence, pcie_read_ptr, cmd_ptr, fetch_size, trid);
-        pending_read_trid = trid;
-        if (stall_state == STALL_NEXT && pending_read_size != 0) {
-            // No pending reads -> stall_state can be set to STALLED, since the read to the cmd
-            // that initiated the stall has been issued.
-            // exec_buf is the first command being fetched and should be offset
-            // by preamble size. After ensuring that the exec_buf command has been read (barrier),
-            // exit.
-            barrier_and_stall(pending_read_size, fence, cmd_ptr, pending_read_trid);  // STALL_NEXT -> STALLED
-            return;
+    // Track where the next read should go (fence is only updated after reads complete)
+    // If we have pending reads, calculate next position from base_fence + sum of sizes
+    uint32_t next_read_fence = fence;
+    if (num_pending_reads > 0) {
+        uint32_t total_size = 0;
+        for (uint32_t i = 0; i < num_pending_reads; i++) {
+            total_size += pending_reads[i].size;
+        }
+        next_read_fence = base_fence + total_size;
+        wrap_fence_if_needed(next_read_fence);
+    }
+    
+    // Issue reads when we have data to fetch and space for more pending reads
+    if (fetch_size != 0) {
+        if (issue_read_and_track<preamble_size>(prefetch_q_rd_ptr, next_read_fence, pcie_read_ptr, cmd_ptr, fetch_size,
+                                  pending_reads, num_pending_reads, base_fence, MAX_PENDING_READS)) {
+            if (stall_state == STALL_NEXT) {
+                // exec_buf command - wait for all pending reads and exit
+                barrier_and_stall(base_fence, fence, cmd_ptr, pending_reads, num_pending_reads);
+                num_pending_reads = 0;
+                base_fence = 0;  // Reset base_fence when no pending reads
+                return;
+            }
         }
     }
     if (!cmd_ready) {
-        if (pending_read_size != 0) {
-            // Use transaction-ID-specific barrier instead of full barrier for better performance
-            noc_async_read_barrier_with_trid(pending_read_trid);
-            // wrap the cmddat_q
-            if (fence < cmd_ptr) {
-                cmd_ptr = fence;
+        if (num_pending_reads > 0) {
+            uint32_t total_pending_size = 0;
+            
+            // Wait for all pending reads to complete and handle wrap logic
+            for (uint32_t i = 0; i < num_pending_reads; i++) {
+                noc_async_read_barrier_with_trid(pending_reads[i].trid);
+                total_pending_size += pending_reads[i].size;
+                
+                // Check if this read caused a wrap - if so, we need to update cmd_ptr correctly
+                if (pending_reads[i].wrapped) {
+                    // This read wrapped. If cmd_ptr is in the non-wrapped region, it needs adjustment
+                    if (cmd_ptr >= pending_reads[i].fence_before_read && cmd_ptr < cmddat_q_end) {
+                        // cmd_ptr is in the region that was wrapped - it should be set to the wrapped fence
+                        cmd_ptr = cmddat_q_base;
+                    }
+                }
+            }
+            
+            // Standard wrap check
+            if (base_fence < cmd_ptr) {
+                cmd_ptr = base_fence;
             }
 
-            fence += pending_read_size;
-            pending_read_size = 0;
+            // Update fence to reflect all completed reads
+            fence = base_fence + total_pending_size;
+            wrap_fence_if_needed(fence);
+            num_pending_reads = 0;
+            base_fence = 0;  // Reset base_fence when no pending reads
 
             // After the stall, re-check the host
             prefetch_q_rd_ptr_local = *prefetch_q_rd_ptr;
             fetch_size = (prefetch_q_rd_ptr_local & ~prefetch_q_msb_mask) << prefetch_q_log_minsize;
 
-            if (fetch_size != 0) {
+            if (fetch_size != 0 && num_pending_reads < MAX_PENDING_READS) {
                 stall_flag = (prefetch_q_rd_ptr_local & prefetch_q_msb_mask) != 0;
                 stall_state =
                     static_cast<StallState>(stall_flag << 1);  // NOT_STALLED -> STALL_NEXT if stall_flag is set
 
+                // After barrier, next read should go after all completed reads
+                uint32_t next_fence_after_barrier = fence;
                 if (stall_state == STALL_NEXT) {
                     // If the prefetcher state reached here, it is issuing a read to the same "slot", since for exec_buf
                     // commands we will insert a read barrier. Hence, the exec_buf command will be concatenated to a
                     // previous command, and should not be offset by preamble size.
-                    uint32_t trid;
-                    pending_read_size = read_from_pcie<0>(
-                        prefetch_q_rd_ptr, fence, pcie_read_ptr, cmd_ptr, fetch_size, trid);
-                    pending_read_trid = trid;
-                    if (pending_read_size != 0) {
-                        // if pending_read_size == 0 read_from_pcie early exited, due to a wrap, i.e. the exec_buf cmd
+                    if (issue_read_and_track<0>(prefetch_q_rd_ptr, next_fence_after_barrier, pcie_read_ptr, cmd_ptr, fetch_size,
+                                                  pending_reads, num_pending_reads, base_fence, MAX_PENDING_READS)) {
+                        // if read_size == 0 read_from_pcie early exited, due to a wrap, i.e. the exec_buf cmd
                         // is at a wrapped location, and a read to it could not be issued, since there are existing
                         // commands in the cmddat_q. Only move the stall_state to stalled if the read to the cmd that
                         // initiated the stall was issued
-                        barrier_and_stall(
-                            pending_read_size, fence, cmd_ptr, pending_read_trid);  // STALL_NEXT -> STALLED
+                        barrier_and_stall(base_fence, fence, cmd_ptr, pending_reads, num_pending_reads);  // STALL_NEXT -> STALLED
+                        num_pending_reads = 0;
+                        base_fence = 0;  // Reset base_fence when no pending reads
                     }
                 } else {
-                    uint32_t trid;
-                    pending_read_size = read_from_pcie<preamble_size>(
-                        prefetch_q_rd_ptr, fence, pcie_read_ptr, cmd_ptr, fetch_size, trid);
-                    pending_read_trid = trid;
+                    issue_read_and_track<preamble_size>(prefetch_q_rd_ptr, next_fence_after_barrier, pcie_read_ptr, cmd_ptr, fetch_size,
+                                                           pending_reads, num_pending_reads, base_fence, MAX_PENDING_READS);
                 }
             }
         } else {
@@ -466,6 +623,98 @@ void fetch_q_get_cmds(uint32_t& fence, uint32_t& cmd_ptr, uint32_t& pcie_read_pt
             fetch_q_get_cmds<preamble_size>(fence, cmd_ptr, pcie_read_ptr);
             WAYPOINT("HQD");
         }
+    }
+    
+    // If cmd_ready is true, process all available prefetch_q entries
+    // This is critical for large transfers that may be split across multiple entries
+    // We can issue multiple reads since we're tracking multiple transaction IDs
+    if (cmd_ready) {
+        // If we have pending reads but no new entries, we need to wait for at least one to complete
+        // Otherwise we'll never make progress
+        if (fetch_size == 0 && num_pending_reads > 0) {
+            // Wait for the oldest read to complete
+            PendingRead completed_read = pending_reads[0];
+            noc_async_read_barrier_with_trid(completed_read.trid);
+            uint32_t completed_size = completed_read.size;
+            // Update cmd_ptr if wrap occurred
+            if (completed_read.wrapped && cmd_ptr >= completed_read.fence_before_read && cmd_ptr < cmddat_q_end) {
+                cmd_ptr = cmddat_q_base;
+            }
+            // Shift remaining reads down
+            for (uint32_t i = 1; i < num_pending_reads; i++) {
+                pending_reads[i-1] = pending_reads[i];
+            }
+            num_pending_reads--;
+            // Update base_fence and fence
+            base_fence += completed_size;
+            wrap_fence_if_needed(base_fence);
+            fence = base_fence;
+            // Reset base_fence if no more pending reads
+            if (num_pending_reads == 0) {
+                base_fence = 0;
+            }
+            // Re-check prefetch_q after completing a read
+            prefetch_q_rd_ptr_local = *prefetch_q_rd_ptr;
+            fetch_size = (prefetch_q_rd_ptr_local & ~prefetch_q_msb_mask) << prefetch_q_log_minsize;
+        }
+        
+        // If we're approaching the limit, wait for at least one read to complete before issuing more
+        // This prevents unbounded accumulation of pending reads
+        if (num_pending_reads >= MAX_PENDING_READS - 1 && fetch_size != 0) {
+            // Wait for the oldest read to complete
+            if (num_pending_reads > 0) {
+                PendingRead completed_read = pending_reads[0];
+                noc_async_read_barrier_with_trid(completed_read.trid);
+                uint32_t completed_size = completed_read.size;
+                // Update cmd_ptr if wrap occurred
+                if (completed_read.wrapped && cmd_ptr >= completed_read.fence_before_read && cmd_ptr < cmddat_q_end) {
+                    cmd_ptr = cmddat_q_base;
+                }
+                // Shift remaining reads down
+                for (uint32_t i = 1; i < num_pending_reads; i++) {
+                    pending_reads[i-1] = pending_reads[i];
+                }
+                num_pending_reads--;
+                // Update base_fence and fence
+                base_fence += completed_size;
+                wrap_fence_if_needed(base_fence);
+                fence = base_fence;
+                // Reset base_fence if no more pending reads
+                if (num_pending_reads == 0) {
+                    base_fence = 0;
+                }
+            }
+        }
+        
+        // Calculate where next read should go (after any existing pending reads)
+        uint32_t next_fence_cmd_ready = fence;
+        if (num_pending_reads > 0) {
+            uint32_t total_size = 0;
+            for (uint32_t i = 0; i < num_pending_reads; i++) {
+                total_size += pending_reads[i].size;
+            }
+            next_fence_cmd_ready = base_fence + total_size;
+            wrap_fence_if_needed(next_fence_cmd_ready);
+        }
+        
+        // Loop to process all available prefetch_q entries
+        // Issue reads until we run out of entries or hit the pending read limit
+        while (num_pending_reads < MAX_PENDING_READS && fetch_size != 0) {
+            stall_flag = (prefetch_q_rd_ptr_local & prefetch_q_msb_mask) != 0;
+            stall_state = static_cast<StallState>((stall_flag ? 1 : 0) << 1);
+            
+            // Issue read - if it fails, exit to let caller process existing commands
+            if (!issue_read_and_track<preamble_size>(prefetch_q_rd_ptr, next_fence_cmd_ready, pcie_read_ptr, cmd_ptr, fetch_size,
+                                                       pending_reads, num_pending_reads, base_fence, MAX_PENDING_READS)) {
+                break;
+            }
+            
+            // Check for next entry
+            prefetch_q_rd_ptr_local = *prefetch_q_rd_ptr;
+            fetch_size = (prefetch_q_rd_ptr_local & ~prefetch_q_msb_mask) << prefetch_q_log_minsize;
+        }
+        // Exit - reads will complete asynchronously, will be handled on next call
+        // Note: fence is not updated here - it will be updated when reads complete in !cmd_ready case
     }
 }
 
