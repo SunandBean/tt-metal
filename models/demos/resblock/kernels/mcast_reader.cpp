@@ -181,6 +181,9 @@ FORCE_INLINE void wait_for_gather(
     noc_semaphore_set(mcast_receiver_semaphore_addr_ptr, 0);
 }
 
+// Maximum NOC burst size (16KB for Blackhole)
+constexpr uint32_t NOC_MAX_BURST_SIZE_BYTES = 16384;
+
 template <uint32_t mcast_num_cores>
 FORCE_INLINE void mcast(
     uint32_t mcast_cb,
@@ -192,6 +195,13 @@ FORCE_INLINE void mcast(
     uint64_t mcast_sender_noc_coord_y_end,
     uint64_t mcast_semaphore_noc_addr) {
     DeviceZoneScopedN("mcast");
+    DPRINT << "MCAST: mcast - starting mcast to " << mcast_num_cores << " cores" << ENDL();
+
+    const uint32_t src_addr = get_read_ptr(mcast_cb);
+    const uint32_t len_bytes = get_tile_size(mcast_cb) * mcast_num_cores;
+
+    DPRINT << "MCAST: mcast - len_bytes=" << len_bytes << ENDL();
+
     // Mcast to all cores using persistent sender
     const uint64_t mcast_data_noc_addr = get_noc_multicast_addr<noc_index>(
         mcast_sender_noc_coord_x_start,
@@ -200,30 +210,60 @@ FORCE_INLINE void mcast(
         mcast_sender_noc_coord_y_end,
         mcast_dest_base_addr);
 
-    // Set up state for data send (coordinates and addresses)
-    const uint32_t src_addr = get_read_ptr(mcast_cb);
-    const uint32_t len_bytes = get_tile_size(mcast_cb) * mcast_num_cores;
-    mcast_send_set_state<
-        mcast_num_cores,
-        false,  // loopback: mcast core is not part of sender grid
-        false,  // is_part_of_receiver_grid: mcast core is not part of sender grid
-        true,   // linked
-        true,   // posted
-        true,   // set_addresses: set source and destination addresses
-        true,   // set_size: set transfer size
-        write_cmd_buf>(src_addr, mcast_data_noc_addr, len_bytes);
+    // For large transfers (>16KB), split into multiple packets
+    if (len_bytes <= NOC_MAX_BURST_SIZE_BYTES) {
+        // Single packet - original code path
+        mcast_send_set_state<
+            mcast_num_cores,
+            false,  // loopback: mcast core is not part of sender grid
+            false,  // is_part_of_receiver_grid: mcast core is not part of sender grid
+            true,   // linked
+            true,   // posted
+            true,   // set_addresses: set source and destination addresses
+            true,   // set_size: set transfer size
+            write_cmd_buf>(src_addr, mcast_data_noc_addr, len_bytes);
 
-    // Send data using persistent sender
-    mcast_send_with_state<
-        mcast_num_cores,
-        false,  // loopback: mcast core is not part of sender grid
-        false,  // is_part_of_receiver_grid: mcast core is not part of sender grid
-        true,   // linked
-        true,   // posted
-        false,  // set_addresses: already set in mcast_send_set_state
-        false,  // set_size: already set in mcast_send_set_state
-        write_cmd_buf>(0, 0, 0);
+        // Send data using persistent sender
+        mcast_send_with_state<
+            mcast_num_cores,
+            false,  // loopback: mcast core is not part of sender grid
+            false,  // is_part_of_receiver_grid: mcast core is not part of sender grid
+            true,   // linked
+            true,   // posted
+            false,  // set_addresses: already set in mcast_send_set_state
+            false,  // set_size: already set in mcast_send_set_state
+            write_cmd_buf>(0, 0, 0);
+    } else {
+        // Multiple packets needed - chunked transfer
+        uint32_t bytes_sent = 0;
+        while (bytes_sent < len_bytes) {
+            uint32_t chunk_size = len_bytes - bytes_sent;
+            if (chunk_size > NOC_MAX_BURST_SIZE_BYTES) {
+                chunk_size = NOC_MAX_BURST_SIZE_BYTES;
+            }
 
+            uint32_t chunk_src_addr = src_addr + bytes_sent;
+            uint32_t chunk_dest_addr = mcast_dest_base_addr + bytes_sent;
+
+            const uint64_t chunk_noc_addr = get_noc_multicast_addr<noc_index>(
+                mcast_sender_noc_coord_x_start,
+                mcast_sender_noc_coord_y_start,
+                mcast_sender_noc_coord_x_end,
+                mcast_sender_noc_coord_y_end,
+                chunk_dest_addr);
+
+            DPRINT << "MCAST: mcast - sending chunk: offset=" << bytes_sent << ", size=" << chunk_size << ENDL();
+
+            mcast_send_set_state<mcast_num_cores, false, false, true, true, true, true, write_cmd_buf>(
+                chunk_src_addr, chunk_noc_addr, chunk_size);
+
+            mcast_send_with_state<mcast_num_cores, false, false, true, true, false, false, write_cmd_buf>(0, 0, 0);
+
+            bytes_sent += chunk_size;
+        }
+    }
+
+    DPRINT << "MCAST: mcast - data sent, setting up semaphore" << ENDL();
     // Use L1 scratch to hold VALID value for multicast semaphore set
     uint32_t semaphore_valid_addr = mcast_dest_base_addr;
     volatile tt_l1_ptr uint32_t* semaphore_valid_addr_ptr = (volatile tt_l1_ptr uint32_t*)semaphore_valid_addr;
@@ -249,6 +289,7 @@ FORCE_INLINE void mcast(
         false,  // set_size
         write_reg_cmd_buf>(0, 0, 0);
     noc_async_posted_writes_flushed();
+    DPRINT << "MCAST: mcast - DONE" << ENDL();
 }
 
 void kernel_main() {

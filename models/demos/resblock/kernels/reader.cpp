@@ -30,7 +30,9 @@ template <
     uint32_t MCastReceiverSemaphoreId>
 void gather(uint32_t receiver_data_addr, uint32_t offset) {
     DeviceZoneScopedN("gather");
+    DPRINT << "READER: gather - waiting CbIn(" << CbIn << ") for " << NumTiles << " tiles" << ENDL();
     cb_wait_front(CbIn, NumTiles);
+    DPRINT << "READER: gather - CbIn ready" << ENDL();
 
     // tt::data_movement::common::print_bf16_pages(get_read_ptr(CbIn), get_tile_size(CbIn), NumTiles, 0);
 
@@ -41,12 +43,15 @@ void gather(uint32_t receiver_data_addr, uint32_t offset) {
     const uint64_t mcast_receiver_semaphore_noc_addr =
         mcast_receiver_noc_coord | (uint64_t)mcast_receiver_semaphore_addr;
 
+    DPRINT << "READER: gather - writing to receiver and signaling" << ENDL();
     noc_async_write_one_packet<true, true>(get_read_ptr(CbIn), mcast_receiver_noc_addr, get_tile_size(CbIn) * NumTiles);
     noc_semaphore_inc<true>(mcast_receiver_semaphore_noc_addr, 1);
     noc_async_posted_writes_flushed();
 
     // cb_push_back(CbOut, NumTiles); Don't pop yet because mcast needs to happen first
+    DPRINT << "READER: gather - popping CbIn" << ENDL();
     cb_pop_front(CbIn, NumTiles);
+    DPRINT << "READER: gather - DONE" << ENDL();
 }
 
 void kernel_main() {
@@ -71,12 +76,20 @@ void kernel_main() {
 
     const uint32_t tile_index = get_arg_val<uint32_t>(0);
 
+    DPRINT << "READER: kernel_main START - num_layers=" << num_layers << ", num_tiles_k=" << num_tiles_k
+           << ", tile_index=" << tile_index << ENDL();
+    DPRINT << "READER: CBs - mm1=" << mm1_full_cb << ", w0=" << weight0_cb << ", w1=" << weight1_cb << ENDL();
+    DPRINT << "READER: CBs - intermediate=" << intermediate_pregather_cb << ", mm2=" << mm2_full_cb
+           << ", out=" << out_cb << ENDL();
+
     const uint32_t mcast_receiver_base_address = get_write_ptr(mcast_receiver_cb);
 
     constexpr uint32_t num_output_tiles = 1;  // Set to 1 because we only iterate over K tiles at a time
 
+    DPRINT << "READER: pushing initial mm1_full_cb" << ENDL();
     cb_reserve_back(mm1_full_cb, num_tiles_k);
     cb_push_back(mm1_full_cb, num_tiles_k);
+    DPRINT << "READER: mm1_full_cb ready" << ENDL();
 
     // DPRINT << "residual before first matmul:" << ENDL();
     // tt::data_movement::common::print_bf16_pages(get_read_ptr(mm1_full_cb), get_tile_size(mm1_full_cb), num_tiles_k,
@@ -85,20 +98,25 @@ void kernel_main() {
     // Push full stacked weights for all layers: num_tiles_k * num_layers
     // Each layer will pop num_tiles_k tiles as it processes
     constexpr uint32_t total_weight_tiles = num_tiles_k * num_layers;
+    DPRINT << "READER: pushing weight0_cb (" << total_weight_tiles << " tiles)" << ENDL();
     cb_reserve_back(weight0_cb, total_weight_tiles);
     cb_push_back(weight0_cb, total_weight_tiles);
 
+    DPRINT << "READER: pushing weight1_cb (" << total_weight_tiles << " tiles)" << ENDL();
     cb_reserve_back(weight1_cb, total_weight_tiles);
     cb_push_back(weight1_cb, total_weight_tiles);
+    DPRINT << "READER: weights ready" << ENDL();
 
     // Compute gather destination tile offset bytes from runtime tile index
     const uint32_t gather_destination_tile_offset_bytes = tile_index * get_tile_size(intermediate_pregather_cb);
 
     for (uint32_t layer = 0; layer < num_layers; layer++) {
+        DPRINT << "READER: ===== LAYER " << layer << " START =====" << ENDL();
         {
             DeviceZoneScopedN("layer_gather_and_mcast");
 
             // Gather after first matmul so that we can mcast full result to all cores
+            DPRINT << "READER: layer " << layer << " - first gather (matmul+relu result)" << ENDL();
             gather<
                 intermediate_pregather_cb,
                 mm2_full_cb,
@@ -107,7 +125,9 @@ void kernel_main() {
                 mcast_receiver_noc_y,
                 mcast_receiver_semaphore_id>(mcast_receiver_base_address, gather_destination_tile_offset_bytes);
             // Wait for mcast to complete and then push back to mm2_full_cb which will start the second matmul
+            DPRINT << "READER: layer " << layer << " - waiting for first mcast (mm2_full_cb)" << ENDL();
             wait_for_mcast<mm2_full_cb, num_tiles_k>(mcast_sender_semaphore_addr_ptr);
+            DPRINT << "READER: layer " << layer << " - first mcast complete" << ENDL();
             // DPRINT << "mm1_full_cb after gather:" << ENDL();
             // tt::data_movement::common::print_bf16_pages(
             // get_read_ptr(mm1_full_cb), get_tile_size(mm1_full_cb), num_tiles_k, 0);
@@ -115,6 +135,7 @@ void kernel_main() {
         {
             DeviceZoneScopedN("layer_gather_and_mcast_2");
             // Gather after second matmul so that we can mcast full result to all cores
+            DPRINT << "READER: layer " << layer << " - second gather (matmul+bias result)" << ENDL();
             gather<
                 intermediate_pregather_cb,
                 mm2_full_cb,
@@ -123,13 +144,17 @@ void kernel_main() {
                 mcast_receiver_noc_y,
                 mcast_receiver_semaphore_id>(mcast_receiver_base_address, gather_destination_tile_offset_bytes);
             // Wait for mcast to complete and then push back to mm1_full_cb (ping-pong back)
+            DPRINT << "READER: layer " << layer << " - waiting for second mcast (mm1_full_cb)" << ENDL();
             wait_for_mcast<mm1_full_cb, num_tiles_k>(mcast_sender_semaphore_addr_ptr);
+            DPRINT << "READER: layer " << layer << " - second mcast complete" << ENDL();
         }
+        DPRINT << "READER: ===== LAYER " << layer << " END =====" << ENDL();
     }
 
     {
         DeviceZoneScopedN("copy_output");
 
+        DPRINT << "READER: copying output to out_cb" << ENDL();
         // Calculate offset for this core's data in mm1_full_cb (mcast contains data from all cores)
         const uint32_t src_addr = get_read_ptr(mm1_full_cb) + gather_destination_tile_offset_bytes;
         constexpr uint32_t number_of_tiles_to_copy_into_output = 1;
@@ -140,5 +165,7 @@ void kernel_main() {
         noc_async_write_barrier();
         cb_pop_front(mm1_full_cb, num_tiles_k);
         cb_push_back(out_cb, num_output_tiles);
+        DPRINT << "READER: output copy complete" << ENDL();
     }
+    DPRINT << "READER: kernel_main END" << ENDL();
 }

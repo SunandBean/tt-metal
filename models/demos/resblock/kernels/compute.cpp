@@ -6,6 +6,9 @@
 
 #include <tools/profiler/kernel_profiler.hpp>
 
+#include "api/debug/dprint.h"
+#include "api/debug/dprint_tensix.h"
+
 #include "compute_kernel_api/matmul.h"
 #include "compute_kernel_api/eltwise_unary/relu.h"
 #include "compute_kernel_api/eltwise_binary_sfpu.h"
@@ -42,10 +45,15 @@ template <
 FORCE_INLINE void matmul_with_relu_block() {
     DeviceZoneScopedN("matmul_with_relu_block");
 
+    DPRINT << "COMPUTE: matmul_relu_block - waiting CbA(" << CbA << ") for " << NumTilesK << " tiles" << ENDL();
     cb_wait_front(CbA, NumTilesK);
+    DPRINT << "COMPUTE: matmul_relu_block - CbA ready, waiting CbB(" << CbB << ") for " << NumTilesK << " tiles"
+           << ENDL();
     cb_wait_front(CbB, NumTilesK);
+    DPRINT << "COMPUTE: matmul_relu_block - CbB ready, reserving CbOut(" << CbOut << ")" << ENDL();
     constexpr uint32_t num_output_tiles = 1;
     cb_reserve_back(CbOut, num_output_tiles);
+    DPRINT << "COMPUTE: matmul_relu_block - CbOut reserved, acquiring regs" << ENDL();
 
     tile_regs_acquire();
 
@@ -65,17 +73,21 @@ FORCE_INLINE void matmul_with_relu_block() {
         relu_tile(0);
     }
     tile_regs_commit();
+    DPRINT << "COMPUTE: matmul_relu_block - regs committed" << ENDL();
 
     if constexpr (PopA) {
         cb_pop_front(CbA, NumTilesK);
     }
     cb_pop_front(CbB, NumTilesK);  // Pop weight CB to advance to next layer's weights
 
+    DPRINT << "COMPUTE: matmul_relu_block - waiting regs for pack" << ENDL();
     tile_regs_wait();
     pack_tile(0, CbOut, OutputTileId);  // Pack at offset OutputTileId
     tile_regs_release();
 
+    DPRINT << "COMPUTE: matmul_relu_block - pushing CbOut" << ENDL();
     cb_push_back(CbOut, num_output_tiles);
+    DPRINT << "COMPUTE: matmul_relu_block - DONE" << ENDL();
 }
 
 constexpr uint32_t MATMUL_ACC_REG_ID = 0;
@@ -130,20 +142,26 @@ FORCE_INLINE void matmul_with_bias_block(uint32_t bias_tile_index) {
     }
 
     tile_regs_commit();
+    DPRINT << "COMPUTE: matmul_bias_block - regs committed" << ENDL();
 
     if constexpr (PopA) {
+        DPRINT << "COMPUTE: matmul_bias_block - popping CbA" << ENDL();
         cb_pop_front(CbA, NumTilesK);
     }
     if constexpr (PopBias) {
+        DPRINT << "COMPUTE: matmul_bias_block - popping CbBias" << ENDL();
         cb_pop_front(CbBias, NumTilesBias);
     }
     cb_pop_front(CbB, NumTilesK);  // Pop weight CB to advance to next layer's weights
 
+    DPRINT << "COMPUTE: matmul_bias_block - waiting regs for pack" << ENDL();
     tile_regs_wait();
     pack_tile(MATMUL_ACC_REG_ID, CbOut, OutputTileId);  // Pack at offset OutputTileId
     tile_regs_release();
 
+    DPRINT << "COMPUTE: matmul_bias_block - pushing CbOut" << ENDL();
     cb_push_back(CbOut, num_output_tiles);
+    DPRINT << "COMPUTE: matmul_bias_block - DONE" << ENDL();
 }
 
 namespace NAMESPACE {
@@ -161,21 +179,29 @@ void MAIN {
 
     const uint32_t bias_tile_index = get_arg_val<uint32_t>(0);
 
+    DPRINT << "COMPUTE: kernel_main START - num_layers=" << num_layers << ", num_tiles_k=" << num_tiles_k << ENDL();
+    DPRINT << "COMPUTE: CBs - mm1=" << mm1_full_cb << ", w0=" << weight0_cb << ", w1=" << weight1_cb
+           << ", out=" << out_cb << ENDL();
+    DPRINT << "COMPUTE: CBs - intermediate=" << intermediate_pregather_cb << ", mm2=" << mm2_full_cb << ENDL();
+
     constexpr uint32_t num_output_tiles = 1;
     constexpr uint32_t out_subblock_h = 1;
     constexpr uint32_t out_subblock_w = 1;
     constexpr uint32_t in0_block_w = 1;
 
+    DPRINT << "COMPUTE: initializing mm_block" << ENDL();
     if constexpr (use_custom_mm) {
         custom_mm_block_init(mm1_full_cb, weight0_cb, intermediate_pregather_cb, false, num_tiles_k);
     } else {
         mm_block_init(
             mm1_full_cb, weight0_cb, intermediate_pregather_cb, false, out_subblock_w, out_subblock_h, in0_block_w);
     }
+    DPRINT << "COMPUTE: mm_block initialized" << ENDL();
 
     // All layers use the same pattern: MM1_FULL_CB -> matmul+relu, then MM2_FULL_CB (bias MM1_FULL_CB) -> matmul+bias
     // The ping-pong mcast restores MM1_FULL_CB after each layer
     for (uint32_t layer = 0; layer < num_layers; layer++) {
+        DPRINT << "COMPUTE: ===== LAYER " << layer << " START =====" << ENDL();
         if constexpr (use_custom_mm) {
             custom_mm_block_init(mm1_full_cb, weight0_cb, intermediate_pregather_cb, false, num_tiles_k);
         } else {
@@ -184,6 +210,7 @@ void MAIN {
         }
         // MM1_FULL_CB -> matmul+relu -> INTERMEDIATE_PREGATHER_CB
         // Don't pop MM1 yet - needed for bias
+        DPRINT << "COMPUTE: layer " << layer << " - starting matmul_with_relu_block" << ENDL();
         matmul_with_relu_block<
             mm1_full_cb,
             weight0_cb,
@@ -192,9 +219,11 @@ void MAIN {
             0,
             false,
             use_custom_mm>();
+        DPRINT << "COMPUTE: layer " << layer << " - matmul_with_relu_block complete" << ENDL();
 
         // MM2_FULL_CB (with MM1_FULL_CB bias) -> matmul+bias -> INTERMEDIATE_PREGATHER_CB
         // Pop both MM2 (input) and MM1 (bias/residual) after this
+        DPRINT << "COMPUTE: layer " << layer << " - starting matmul_with_bias_block" << ENDL();
         matmul_with_bias_block<
             mm2_full_cb,
             weight1_cb,
@@ -206,6 +235,9 @@ void MAIN {
             true,
             true,
             use_custom_mm>(bias_tile_index);
+        DPRINT << "COMPUTE: layer " << layer << " - matmul_with_bias_block complete" << ENDL();
+        DPRINT << "COMPUTE: ===== LAYER " << layer << " END =====" << ENDL();
     }
+    DPRINT << "COMPUTE: kernel_main END" << ENDL();
 }
 }  // namespace NAMESPACE
