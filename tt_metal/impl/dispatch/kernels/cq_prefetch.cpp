@@ -245,7 +245,7 @@ CQRelayClient<fabric_mux_num_buffers_per_channel, fabric_mux_channel_buffer_size
     relay_client;
 
 // Feature to stall the prefetcher, mainly for ExecBuf impl which reuses CmdDataQ
-static enum StallState { STALL_NEXT = 2, NOT_STALLED = 0 } stall_state = NOT_STALLED;
+static enum StallState { STALL_NEXT = 2, STALLED = 1, NOT_STALLED = 0 } stall_state = NOT_STALLED;
 
 static_assert((downstream_cb_base & (downstream_cb_page_size - 1)) == 0);
 
@@ -289,13 +289,16 @@ FORCE_INLINE void write_downstream(
     local_downstream_data_ptr += length;
 }
 
-FORCE_INLINE void update_fetch_q_ptrs(
-    uint32_t& pending_read_size, uint32_t& fence, uint32_t& cmd_ptr, const uint32_t cmd_ptr_end) {
-    if ((fence < cmd_ptr) && (cmd_ptr == cmd_ptr_end)) {
+// If prefetcher must stall after this fetch, wait for data to come back, and move to stalled state.
+FORCE_INLINE void barrier_and_stall(uint32_t& pending_read_size, uint32_t& fence, uint32_t& cmd_ptr, uint32_t trid) {
+    // Use transaction-ID-specific barrier since we know which transaction ID was used
+    noc_async_read_barrier_with_trid(trid);
+    if (fence < cmd_ptr) {
         cmd_ptr = fence;
     }
     fence += pending_read_size;
     pending_read_size = 0;
+    stall_state = STALLED;
 }
 
 template <uint32_t preamble_size>
@@ -304,30 +307,14 @@ FORCE_INLINE uint32_t read_from_pcie(
     uint32_t& fence,
     uint32_t& pcie_read_ptr,
     uint32_t cmd_ptr,
-    uint32_t& cmd_ptr_end,
-    uint32_t size) {
+    uint32_t size,
+    uint32_t& out_trid) {
     static uint32_t transaction_id = 0U;
     uint32_t pending_read_size = 0;
-    uint32_t needed_space = size + preamble_size;
-
-    // Check if there's enough space in cmddat_q for the read
-    // This prevents overwriting unprocessed commands (cmd_ptr) when fence has wrapped but cmd_ptr hasn't
-    if (fence < cmd_ptr) {
-        // Wrapped case: unprocessed commands in [cmd_ptr, cmddat_q_end) ∪ [cmddat_q_base, fence)
-        // Available space is from fence to cmd_ptr
-        const uint32_t available_space = cmd_ptr - fence;
-        if (needed_space > available_space) {
-            // Not enough space in circular queue so wait for reads to catch up
-            noc_async_read_barrier();
-            cmd_ptr = fence;
-            // fence += needed_space;
-        }
-    }
-
     // Wrap cmddat_q
-    if (fence + needed_space > cmddat_q_end) {
+    if (fence + size + preamble_size > cmddat_q_end) {
         // only wrap if there are no commands ready, otherwise we'll leave some on the floor
-        cmd_ptr_end = fence;
+        // TODO: does this matter for perf?
         if (cmd_ptr != fence) {
             // No pending reads, since the location of fence cannot be moved due to unread commands
             // in the cmddat_q -> reads cannot be issued to fill the queue.
@@ -343,7 +330,8 @@ FORCE_INLINE uint32_t read_from_pcie(
 
     uint64_t host_src_addr = pcie_noc_xy | pcie_read_ptr;
     // DPRINT << "read_from_pcie: " << fence + preamble_size << " " << pcie_read_ptr << ENDL();
-    noc_async_read_set_trid(transaction_id++ % 16U);
+    out_trid = transaction_id++ & 15U;
+    noc_async_read_set_trid(out_trid);
     noc_async_read(host_src_addr, fence + preamble_size, size);
     pending_read_size = size + preamble_size;
     pcie_read_ptr += size;
@@ -386,40 +374,53 @@ FORCE_INLINE uint32_t read_from_pcie(
 template <uint32_t preamble_size>
 void fetch_q_get_cmds(uint32_t& fence, uint32_t& cmd_ptr, uint32_t& pcie_read_ptr) {
     static uint32_t pending_read_size = 0;
-    static uint32_t cmd_ptr_end = cmddat_q_end;
+    static uint32_t pending_read_trid = 0;
     static volatile tt_l1_ptr prefetch_q_entry_type* prefetch_q_rd_ptr =
         (volatile tt_l1_ptr prefetch_q_entry_type*)prefetch_q_base;
     constexpr uint32_t prefetch_q_msb_mask = 1u << (sizeof(prefetch_q_entry_type) * CHAR_BIT - 1);
 
+    if (stall_state == STALLED) {
+        ASSERT(pending_read_size == 0);  // Before stalling, fetch must have been completed.
+        return;
+    }
+
     // DPRINT << "fetch_q_get_cmds: " << cmd_ptr << " " << fence << ENDL();
-    // if (fence < cmd_ptr) {
-    //    cmd_ptr = fence;
-    //}
+    if (fence < cmd_ptr) {
+        cmd_ptr = fence;
+    }
 
     bool cmd_ready = (cmd_ptr != fence);
 
     uint32_t prefetch_q_rd_ptr_local = *prefetch_q_rd_ptr;
     uint32_t fetch_size = (prefetch_q_rd_ptr_local & ~prefetch_q_msb_mask) << prefetch_q_log_minsize;
     bool stall_flag = (prefetch_q_rd_ptr_local & prefetch_q_msb_mask) != 0;
-    stall_state = static_cast<StallState>((stall_flag ? 1 : 0) << 1);  // NOT_STALLED -> STALL_NEXT if stall_flag is set
+    stall_state = static_cast<StallState>(stall_flag << 1);  // NOT_STALLED -> STALL_NEXT if stall_flag is set
 
     if (fetch_size != 0 && pending_read_size == 0) {
-        pending_read_size =
-            read_from_pcie<preamble_size>(prefetch_q_rd_ptr, fence, pcie_read_ptr, cmd_ptr, cmd_ptr_end, fetch_size);
+        uint32_t trid;
+        pending_read_size = read_from_pcie<preamble_size>(prefetch_q_rd_ptr, fence, pcie_read_ptr, cmd_ptr, fetch_size, trid);
+        pending_read_trid = trid;
         if (stall_state == STALL_NEXT && pending_read_size != 0) {
             // No pending reads -> stall_state can be set to STALLED, since the read to the cmd
             // that initiated the stall has been issued.
             // exec_buf is the first command being fetched and should be offset
             // by preamble size. After ensuring that the exec_buf command has been read (barrier),
             // exit.
-            update_fetch_q_ptrs(pending_read_size, fence, cmd_ptr, cmd_ptr_end);  // STALL_NEXT -> STALLED
+            barrier_and_stall(pending_read_size, fence, cmd_ptr, pending_read_trid);  // STALL_NEXT -> STALLED
             return;
         }
     }
     if (!cmd_ready) {
         if (pending_read_size != 0) {
-            noc_async_read_barrier();
-            update_fetch_q_ptrs(pending_read_size, fence, cmd_ptr, cmd_ptr_end);
+            // Use transaction-ID-specific barrier instead of full barrier for better performance
+            noc_async_read_barrier_with_trid(pending_read_trid);
+            // wrap the cmddat_q
+            if (fence < cmd_ptr) {
+                cmd_ptr = fence;
+            }
+
+            fence += pending_read_size;
+            pending_read_size = 0;
 
             // After the stall, re-check the host
             prefetch_q_rd_ptr_local = *prefetch_q_rd_ptr;
@@ -427,25 +428,30 @@ void fetch_q_get_cmds(uint32_t& fence, uint32_t& cmd_ptr, uint32_t& pcie_read_pt
 
             if (fetch_size != 0) {
                 stall_flag = (prefetch_q_rd_ptr_local & prefetch_q_msb_mask) != 0;
-                stall_state = static_cast<StallState>(
-                    (stall_flag ? 1 : 0) << 1);  // NOT_STALLED -> STALL_NEXT if stall_flag is set
+                stall_state =
+                    static_cast<StallState>(stall_flag << 1);  // NOT_STALLED -> STALL_NEXT if stall_flag is set
 
                 if (stall_state == STALL_NEXT) {
                     // If the prefetcher state reached here, it is issuing a read to the same "slot", since for exec_buf
                     // commands we will insert a read barrier. Hence, the exec_buf command will be concatenated to a
                     // previous command, and should not be offset by preamble size.
-                    pending_read_size =
-                        read_from_pcie<0>(prefetch_q_rd_ptr, fence, pcie_read_ptr, cmd_ptr, cmd_ptr_end, fetch_size);
+                    uint32_t trid;
+                    pending_read_size = read_from_pcie<0>(
+                        prefetch_q_rd_ptr, fence, pcie_read_ptr, cmd_ptr, fetch_size, trid);
+                    pending_read_trid = trid;
                     if (pending_read_size != 0) {
                         // if pending_read_size == 0 read_from_pcie early exited, due to a wrap, i.e. the exec_buf cmd
                         // is at a wrapped location, and a read to it could not be issued, since there are existing
                         // commands in the cmddat_q. Only move the stall_state to stalled if the read to the cmd that
                         // initiated the stall was issued
-                        update_fetch_q_ptrs(pending_read_size, fence, cmd_ptr, cmd_ptr_end);  // STALL_NEXT -> STALLED
+                        barrier_and_stall(
+                            pending_read_size, fence, cmd_ptr, pending_read_trid);  // STALL_NEXT -> STALLED
                     }
                 } else {
+                    uint32_t trid;
                     pending_read_size = read_from_pcie<preamble_size>(
-                        prefetch_q_rd_ptr, fence, pcie_read_ptr, cmd_ptr, cmd_ptr_end, fetch_size);
+                        prefetch_q_rd_ptr, fence, pcie_read_ptr, cmd_ptr, fetch_size, trid);
+                    pending_read_trid = trid;
                 }
             }
         } else {
@@ -1945,10 +1951,12 @@ void kernel_main_h() {
         volatile CQPrefetchCmd tt_l1_ptr* cmd =
             (volatile CQPrefetchCmd tt_l1_ptr*)(cmd_ptr + sizeof(CQPrefetchHToPrefetchDHeader));
         uint32_t cmd_id = cmd->base.cmd_id;
+        // Infer that an exec_buf command is to be executed based on the stall state.
+        bool is_exec_buf = (stall_state == STALLED);
         if (cmd_id == CQ_PREFETCH_CMD_RELAY_LINEAR_H) {
             cmd_ptr += process_relay_linear_h_cmd(cmd_ptr);
         } else {
-            cmd_ptr = process_relay_inline_all(cmd_ptr, fence, false);
+            cmd_ptr = process_relay_inline_all(cmd_ptr, fence, is_exec_buf);
         }
 
         // Note: one fetch_q entry can contain multiple commands
