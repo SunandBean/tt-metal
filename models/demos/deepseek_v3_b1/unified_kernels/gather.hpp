@@ -10,6 +10,8 @@
 #include "api/dataflow/dataflow_api.h"
 #endif
 
+#include "api/debug/dprint.h"
+
 namespace deepseek_b1_ops {
 
 // ============================================================================
@@ -89,13 +91,17 @@ struct Gather {
 
     private:
         void impl([[maybe_unused]] const RTArgs& args) {
+            DPRINT << "gather sender" << (uint32_t)IsSenderCore << (uint32_t)IsReceiverCore << (uint32_t)pop_src
+                   << ENDL();
 #if defined(COMPILE_FOR_NCRISC)
             // ================================================================
             // NCRISC (Sender) - DataMovementProcessor.RISCV_1
             // ================================================================
             if constexpr (IsSenderCore) {
+                DPRINT << "sender waiting for data" << ENDL();
                 // Wait for source CB data to be ready
                 cb_wait_front(args.src_cb, args.src_num_pages);
+                DPRINT << "sender got data" << ENDL();
 
                 // Get source address from CB
                 uint32_t input_data_addr = get_read_ptr(args.src_cb);
@@ -133,8 +139,11 @@ struct Gather {
                     (volatile tt_l1_ptr uint32_t*)noc0_receiver_semaphore_addr;
                 volatile tt_l1_ptr uint32_t* noc1_receiver_semaphore_addr_ptr =
                     (volatile tt_l1_ptr uint32_t*)noc1_receiver_semaphore_addr;
+                DPRINT << "receiver waiting for semaphores " << args.noc0_num_senders << " " << args.noc1_num_senders
+                       << ENDL();
                 noc_semaphore_wait(noc0_receiver_semaphore_addr_ptr, args.noc0_num_senders);
                 noc_semaphore_wait(noc1_receiver_semaphore_addr_ptr, args.noc1_num_senders);
+                DPRINT << "receiver got semaphores" << ENDL();
                 noc_semaphore_set(noc0_receiver_semaphore_addr_ptr, 0);
                 noc_semaphore_set(noc1_receiver_semaphore_addr_ptr, 0);
 

@@ -88,6 +88,7 @@ struct Matmul {
 
     private:
         void impl(const RTArgs& args) {
+            DPRINT << "matmul" << ENDL();
 #if defined(COMPILE_FOR_TRISC)
             // ================================================================
             // TRISC (Compute)
@@ -105,6 +106,7 @@ struct Matmul {
 
             // Reserve output tiles
             cb_reserve_back(args.out, out_w);
+            DPRINT << "matmul reserved output tiles" << ENDL();
 
             if constexpr (out_w == 1) {
                 // Use optimized custom_mm API for single output tile with K-dimension reduction
@@ -151,8 +153,9 @@ struct Matmul {
             if constexpr (pop_in1) {
                 cb_pop_front(args.in1, args.k_num_tiles * out_w);
             }
-
+            DPRINT << "matmul popped inputs" << ENDL();
             cb_push_back(args.out, out_w);
+            DPRINT << "matmul done" << ENDL();
 #endif
         }
     };  // class Op

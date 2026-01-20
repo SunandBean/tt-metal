@@ -233,6 +233,8 @@ class PreSDPA:
         matmul_input_page_size = TILE_1x32.get_tile_size(data_format)
         matmul_input_total_size = num_tiles * cb_page_size  # Same total bytes as RMSNorm output
         mcast_dst_num_pages = matmul_input_total_size // matmul_input_page_size
+        print(matmul_input_total_size)
+        print(matmul_input_page_size)
 
         # RMSNorm reader compile-time args (named args for NCRISC)
         rmsnorm_reader_named_compile_time_args = [
@@ -242,7 +244,9 @@ class PreSDPA:
             ("rmsnorm_num_tiles", num_tiles),
             ("rmsnorm_num_faces", interpreted_tile.num_faces),
         ]
-
+        print()
+        print("num_tiles: ", num_tiles)
+        print("interpreted_tile faces: ", interpreted_tile.num_faces)
         # Mcast sender compile-time args (named args for BRISC)
         mcast_sender_named_compile_time_args = [
             ("mcast_dest_noc_start_x", mcast_dest_noc_start_core.x),
