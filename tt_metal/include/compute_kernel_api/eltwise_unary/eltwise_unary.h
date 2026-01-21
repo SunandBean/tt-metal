@@ -36,7 +36,7 @@ ALWI void unary_op_init_common(uint32_t icb, uint32_t ocb) {
 
     MATH((llk_math_eltwise_unary_datacopy_init<A2D, DST_ACCUM_MODE>(icb)));
     MATH((llk_math_hw_configure<true /*math_implied_fmts*/, DST_ACCUM_MODE>(icb, icb)));
-#endif    
+#endif
 }
 
 ALWI void init_sfpu(uint32_t icb, uint32_t ocb) { unary_op_init_common(icb, ocb); }

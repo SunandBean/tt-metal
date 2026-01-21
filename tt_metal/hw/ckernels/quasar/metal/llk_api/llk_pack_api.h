@@ -14,7 +14,6 @@
 #include "llk_outputs.h"
 #include "llk_pack.h"
 #include "llk_pack_common.h"
-#include "llk_param_structs.h"
 
 /*************************************************************************
  * LLK PACK
