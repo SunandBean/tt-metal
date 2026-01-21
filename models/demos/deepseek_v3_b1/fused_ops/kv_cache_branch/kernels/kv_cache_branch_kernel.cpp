@@ -137,6 +137,12 @@ KERNEL_ENTRY {
         constexpr uint32_t dkv_matmul_out_w_per_core = get_named_compile_time_arg_val("dkv_matmul_out_w_per_core");
         unified_kernels::setup_sharded_buffer(dkv_matmul_in1, dkv_matmul_k_num_tiles * dkv_matmul_out_w_per_core);
     }
+    if constexpr (Core::is_kv_rmsnorm_core) {
+        // RMSNorm gamma (sharded weights)
+        constexpr uint32_t kv_rmsnorm_gamma_cb = get_named_compile_time_arg_val("kv_rmsnorm_gamma_cb");
+        constexpr uint32_t kv_rmsnorm_num_tiles = get_named_compile_time_arg_val("kv_rmsnorm_num_tiles");
+        unified_kernels::setup_sharded_buffer(kv_rmsnorm_gamma_cb, kv_rmsnorm_num_tiles);
+    }
 #endif
 
     // ========================================================================
@@ -168,5 +174,6 @@ KERNEL_ENTRY {
         deepseek_b1_ops::RMSNorm::Op<KV_RMSNormCTArgs, Core::is_dkv_matmul_core, true> kv_rmsnorm;
         kv_rmsnorm(kv_rmsnorm_args);
     }
+    DPRINT << "KERNEL done" << ENDL();
 }
 KERNEL_END

@@ -155,6 +155,7 @@ struct RMSNorm {
                 cb_pop_front(args.scalars_cb, 1);  // Pop scalar tiles
                 reduce_uninit();
             }
+            DPRINT << "add_rsqrt_tile" << ENDL();
             {
                 add_rsqrt_tile<CTArgs::rsqrt_fast_approx, VectorMode::RC_custom, 1>(num_tiles, args.epsilon);
             }
@@ -166,6 +167,7 @@ struct RMSNorm {
                     cb_pop_front(args.input_cb, num_tiles);
                 }
             }
+            DPRINT << "add_rsqrt_tile done" << ENDL();
             {
                 // Multiply by the weight
                 cb_reserve_back(args.output_cb, num_tiles);
@@ -180,6 +182,7 @@ struct RMSNorm {
                 cb_push_back(args.output_cb, num_tiles);
                 tile_regs_release();
             }
+            DPRINT << "rmsnorm compute done" << ENDL();
         }
 #endif
     };  // class Op
