@@ -115,7 +115,8 @@ class KVCacheBranch:
         gather_noc1_receiver_semaphore_id = 3
 
         kv_numel = 512
-        kv_rmsnorm_num_tiles = kv_numel // (16 * 32)
+        kv_rmsnorm_num_tiles = kv_numel // (16 * 32)  # 512 / 512 = 1 tile (16x32)
+        kv_rmsnorm_num_faces = 2  # 16x32 tiles have 2 faces (16/16 * 32/16 = 1 * 2)
         inv_sqrt_numel = 1.0 / math.sqrt(float(kv_numel))
         kv_scalar_packed = float_to_bfloat16_packed(inv_sqrt_numel)
         epsilon_packed = float_to_uint32(epsilon)
@@ -133,8 +134,8 @@ class KVCacheBranch:
 
         # DKV Matmul
         dkv_matmul_k_num_tiles = 7168 // (32 * 32)
-        kv_rmsnorm_num_tiles = 512 // (32 * 32)
-        kv_rmsnorm_num_faces = 4  # 32x32 tiles have 4 faces
+        # Note: kv_rmsnorm_num_tiles already defined above (line 118) using 16x32 tiles
+        # kv_rmsnorm_num_faces = 2 for 16x32 tiles (1 * 2 = 2 faces)
         TILE_1x32 = ttnn.Tile((1, 32))
         dkv_matmul_input_page_size = TILE_1x32.get_tile_size(input_tensor.dtype)
         dkv_matmul_ncrisc_named_compile_time_args = [
@@ -280,11 +281,21 @@ class KVCacheBranch:
             dkv_matmul_weights_cb, dkv_matmul_weights_tensor
         )
 
-        # CB X: KV RMSNorm input buffer
+        # CB X: KV RMSNorm input buffer (on rmsnorm core, receives gathered data)
         TILE_16x32 = ttnn.Tile((16, 32))
         kv_rmsnorm_tile_descriptor = ttnn.TileDescriptor(TILE_16x32)
         kv_rmsnorm_page_size = TILE_16x32.get_tile_size(input_tensor.dtype)
-        kv_rmsnorm_input_cb_descriptor = ttnn.cb_descriptor_from_sharded_tensor(kv_rmsnorm_input_cb, input_tensor)
+        kv_rmsnorm_input_cb_format = ttnn.CBFormatDescriptor(
+            buffer_index=kv_rmsnorm_input_cb,
+            data_format=data_format,
+            page_size=kv_rmsnorm_page_size,
+            tile=kv_rmsnorm_tile_descriptor,
+        )
+        kv_rmsnorm_input_cb_descriptor = ttnn.CBDescriptor(
+            total_size=kv_rmsnorm_num_tiles * kv_rmsnorm_page_size,
+            core_ranges=gamma_tensor.memory_config().shard_spec.grid,
+            format_descriptors=[kv_rmsnorm_input_cb_format],
+        )
 
         # CB X: KV RMSNorm gamma buffer
         kv_rmsnorm_gamma_cb_descriptor = ttnn.cb_descriptor_from_sharded_tensor(kv_rmsnorm_gamma_cb, gamma_tensor)
