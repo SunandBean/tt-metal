@@ -15,7 +15,6 @@
 #include "tt_metal/fabric/hw/inc/edm_fabric/edm_fabric_utils.hpp"
 #include "tt_metal/fabric/hw/inc/fabric_routing_mode.h"
 #include "tt_metal/fabric/hw/inc/noc_addr.h"
-#include "api/debug/dprint.h"
 #else
 #include <tt_stl/assert.hpp>
 #endif
@@ -138,13 +137,15 @@ static_assert(
 struct SparseMulticastRoutingCommandHeader {
     // Each bit represents a single hop in the target direction
     // Up to 16 hops can be specified in the bitmask.
-    // If the bit is 1, the router will perform the WRITE operation at that hop.
-    // If the bit is 0, the router will simply forward the packet to the next hop.
-    // This continues until the last set bit, which will perform a WRITE operation and not forward the packet any
-    // further.
+    // The router will WRITE AND FORWARD at hops set to 1 and FORWARD ONLY at unset hops.
+    // This continues until the last set bit, which will WRITE ONLY and not forward the packet any further.
+    // For example, if we want to write from device 0 to devices 1 and 4 only:
+    // 0 --> 1 --> 2 --> 3 --> 4 --- 5
+    //      [X]               [X]
+    // We would set a hop mask of 0b01001
     uint16_t hop_mask;
 };
-// TODO: Add static assert?
+// Add static assert?
 
 struct NocUnicastCommandHeader {
     uint64_t noc_address;
@@ -346,6 +347,7 @@ public:
         return *static_cast<Derived*>(this);
     }
 
+    // NOTE: Currently only defined for 1D LowLatency packet headers
     Derived& to_chip_sparse_multicast(const SparseMulticastRoutingCommandHeader& sparse_mcast_routing_command_header) {
         static_cast<Derived*>(this)->to_chip_sparse_multicast_impl(sparse_mcast_routing_command_header);
         return *static_cast<Derived*>(this);
@@ -461,6 +463,7 @@ public:
         return static_cast<volatile Derived*>(this);
     }
 
+    // NOTE: Currently only defined for 1D LowLatency packet headers
     volatile Derived* to_chip_sparse_multicast(
         const SparseMulticastRoutingCommandHeader& sparse_mcast_routing_command_header) volatile {
         static_cast<volatile Derived*>(this)->to_chip_sparse_multicast_impl(sparse_mcast_routing_command_header);
