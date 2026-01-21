@@ -30,7 +30,7 @@ class FusedResblock:
     class McastCoreCBIndex:
         MCAST_CORE_GATHER_CB = 6
 
-    MCAST_CORE = ttnn.CoreCoord(8, 7)
+    MCAST_CORE = ttnn.CoreCoord(0, 8)
 
     @staticmethod
     def golden(input_a: torch.Tensor, weights: List[Tuple[torch.Tensor, torch.Tensor]]) -> torch.Tensor:
@@ -470,12 +470,12 @@ class FusedResblock:
 
         # Partition cores based on hop distance
         for core in input_cores_list:
-            noc0_hop = device.get_worker_noc_hop_distance(core, gather_destination_core, ttnn.NOC.NOC_0)
-            noc1_hop = device.get_worker_noc_hop_distance(core, gather_destination_core, ttnn.NOC.NOC_1)
-            if noc0_hop <= noc1_hop:
-                noc0_cores.append(core)
-            else:
-                noc1_cores.append(core)
+            # noc0_hop = device.get_worker_noc_hop_distance(core, gather_destination_core, ttnn.NOC.NOC_0)
+            # noc1_hop = device.get_worker_noc_hop_distance(core, gather_destination_core, ttnn.NOC.NOC_1)
+            # if noc0_hop <= noc1_hop:
+            noc1_cores.append(core)
+            # else:
+            # noc1_cores.append(core)
 
         # Create CoreRangeSets for NOC0 and NOC1 cores
         noc0_core_range_set = ttnn.CoreRangeSet([ttnn.CoreRange(core, core) for core in noc0_cores])
@@ -486,12 +486,11 @@ class FusedResblock:
             len(noc0_cores) + len(noc1_cores) == all_matmul_cores.num_cores()
         ), f"Core partition mismatch: noc0={len(noc0_cores)}, noc1={len(noc1_cores)}, total={all_matmul_cores.num_cores()}"
 
-        if debug:
-            logger.debug(f"NOC split: NOC0 cores={len(noc0_cores)}, NOC1 cores={len(noc1_cores)}")
-            if len(noc0_cores) > 0:
-                logger.debug(f"NOC0 cores (first 5): {noc0_cores[:5]}")
-            if len(noc1_cores) > 0:
-                logger.debug(f"NOC1 cores (first 5): {noc1_cores[:5]}")
+        logger.debug(f"NOC split: NOC0 cores={len(noc0_cores)}, NOC1 cores={len(noc1_cores)}")
+        if len(noc0_cores) > 0:
+            logger.debug(f"NOC0 cores (first 5): {noc0_cores[:5]}")
+        if len(noc1_cores) > 0:
+            logger.debug(f"NOC1 cores (first 5): {noc1_cores[:5]}")
 
         return noc0_core_range_set, noc1_core_range_set, noc0_cores, noc1_cores
 
