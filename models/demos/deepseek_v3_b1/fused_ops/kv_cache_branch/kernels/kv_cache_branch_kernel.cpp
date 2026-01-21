@@ -34,7 +34,6 @@ KERNEL_ENTRY {
 // Named compile-time args: TODO
 // Runtime args: TODO
 // ============================================================================
-DPRINT << "kv cache branch kernel" << ENDL();
 #if defined(COMPILE_FOR_NCRISC)
     // Matmul CTArgs type alias (NCRISC uses ReaderCTArgs)
     using DKV_MatmulCTArgs = deepseek_b1_ops::Matmul::ReaderCTArgs;
@@ -125,17 +124,14 @@ DPRINT << "kv cache branch kernel" << ENDL();
         get_arg_val<uint32_t>(0),  // epsilon
     };
 #endif
-    DPRINT << " ARGS DONE " << ENDL();
 #if defined(COMPILE_FOR_NCRISC)
     // Setup sharded persistent buffers
     if constexpr (Core::is_dkv_matmul_core) {
-        DPRINT << "setup sharded buffers" << ENDL();
         // Matmul weights
         constexpr uint32_t dkv_matmul_in1 = get_named_compile_time_arg_val("dkv_matmul_in1");
         constexpr uint32_t dkv_matmul_k_num_tiles = get_named_compile_time_arg_val("dkv_matmul_k_num_tiles");
         constexpr uint32_t dkv_matmul_out_w_per_core = get_named_compile_time_arg_val("dkv_matmul_out_w_per_core");
         unified_kernels::setup_sharded_buffer(dkv_matmul_in1, dkv_matmul_k_num_tiles * dkv_matmul_out_w_per_core);
-        DPRINT << "setup sharded buffers done" << ENDL();
     }
 #endif
 
@@ -159,12 +155,12 @@ DPRINT << "kv cache branch kernel" << ENDL();
         dkv_gather(dkv_gather_args);
     }
 
-        // ========================================================================
-        // RMSNorm: Apply RMSNorm to the gathered data
-        {
-            DeviceZoneScopedN("KV_RMSNORM");
-            deepseek_b1_ops::RMSNorm::Op<KV_RMSNormCTArgs, Core::is_dkv_matmul_core, true> kv_rmsnorm;
-            kv_rmsnorm(kv_rmsnorm_args);
-        }
+    // ========================================================================
+    // RMSNorm: Apply RMSNorm to the gathered data
+    {
+        DeviceZoneScopedN("KV_RMSNORM");
+        deepseek_b1_ops::RMSNorm::Op<KV_RMSNormCTArgs, Core::is_dkv_matmul_core, true> kv_rmsnorm;
+        kv_rmsnorm(kv_rmsnorm_args);
+    }
 }
 KERNEL_END

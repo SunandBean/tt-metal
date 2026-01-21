@@ -125,6 +125,7 @@ class KVCacheBranch:
         dkv_matmul_input_cb = 0
         dkv_matmul_output_cb = 1
         dkv_matmul_weights_cb = 2
+        rmsnorm_scalars_cb = 3
         kv_rmsnorm_input_cb = 5
         kv_rmsnorm_interm_cb = 6
         kv_rmsnorm_gamma_cb = 7
@@ -166,9 +167,11 @@ class KVCacheBranch:
             ("kv_rmsnorm_output_cb", kv_rmsnorm_output_cb),
             ("kv_rmsnorm_num_tiles", kv_rmsnorm_num_tiles),
             ("kv_rmsnorm_num_faces", kv_rmsnorm_num_faces),
+            ("rmsnorm_scalars_cb", rmsnorm_scalars_cb),
         ]
         kv_rmsnorm_trisc_named_compile_time_args = [
             ("kv_rmsnorm_input_cb", kv_rmsnorm_input_cb),
+            ("kv_rmsnorm_scalars_cb", rmsnorm_scalars_cb),
             ("kv_rmsnorm_interm_cb", kv_rmsnorm_interm_cb),
             ("kv_rmsnorm_gamma_cb", kv_rmsnorm_gamma_cb),
             ("kv_rmsnorm_output_cb", kv_rmsnorm_output_cb),
@@ -313,6 +316,19 @@ class KVCacheBranch:
             format_descriptors=[kv_rmsnorm_output_cb_format],
         )
 
+        # CB X: RMSNorm scalars buffer (1 tile for reduction scalar)
+        rmsnorm_scalars_cb_format = ttnn.CBFormatDescriptor(
+            buffer_index=rmsnorm_scalars_cb,
+            data_format=data_format,
+            page_size=kv_rmsnorm_page_size,
+            tile=kv_rmsnorm_tile_descriptor,
+        )
+        rmsnorm_scalars_cb_descriptor = ttnn.CBDescriptor(
+            total_size=kv_rmsnorm_page_size,
+            core_ranges=gamma_tensor.memory_config().shard_spec.grid,
+            format_descriptors=[rmsnorm_scalars_cb_format],
+        )
+
         # ========================================================================
         # Semaphore descriptors
         # ========================================================================
@@ -351,7 +367,6 @@ class KVCacheBranch:
             + dkv_matmul_brisc_named_compile_time_args,
             # TRISC named compile-time args
             trisc_named_compile_time_args=kv_rmsnorm_trisc_named_compile_time_args
-            + kv_rmsnorm_trisc_named_compile_time_args
             + dkv_matmul_trisc_named_compile_time_args
             + rmsnorm_compute_named_compile_time_args,
             # TRISC common runtime args: epsilon (used by rmsnorm compute)
@@ -400,6 +415,7 @@ class KVCacheBranch:
                 dkv_matmul_input_cb_descriptor,
                 dkv_matmul_output_cb_descriptor,
                 dkv_matmul_weights_cb_descriptor,
+                rmsnorm_scalars_cb_descriptor,
                 kv_rmsnorm_input_cb_descriptor,
                 kv_rmsnorm_interm_cb_descriptor,
                 kv_rmsnorm_gamma_cb_descriptor,
