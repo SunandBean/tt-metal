@@ -108,6 +108,7 @@ struct RMSNorm {
             // ================================================================
             // Generate reduction scalar (1/sqrt(num_elements))
             generate_reduce_scaler<CTArgs::num_faces>(args.scalars_cb, args.scalar);
+            DPRINT << "rmsnorm reader" << ENDL();
 #elif defined(COMPILE_FOR_TRISC)
             // ================================================================
             // TRISC (Compute)
@@ -116,6 +117,7 @@ struct RMSNorm {
             binary_op_init_common(args.input_cb, args.input_cb, args.output_cb);
             cb_wait_front(args.scalars_cb, 1);
             cb_wait_front(args.gamma_cb, CTArgs::num_tiles);  // we don't pop, only wait once and reuse
+            DPRINT << "rmsnorm compute" << ENDL();
 
             compute_rmsnorm(args);
 #endif

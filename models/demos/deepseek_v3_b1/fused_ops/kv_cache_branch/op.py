@@ -138,6 +138,7 @@ class KVCacheBranch:
         TILE_1x32 = ttnn.Tile((1, 32))
         dkv_matmul_input_page_size = TILE_1x32.get_tile_size(input_tensor.dtype)
         dkv_matmul_ncrisc_named_compile_time_args = [
+            ("dkv_matmul_in0", dkv_matmul_input_cb),
             ("dkv_matmul_in1", dkv_matmul_weights_cb),
             ("dkv_matmul_k_num_tiles", dkv_matmul_k_num_tiles),
             ("dkv_matmul_out_w_per_core", dkv_matmul_out_w),
@@ -211,7 +212,7 @@ class KVCacheBranch:
         # Gather sender compile-time args (named args for NCRISC on matmul cores)
         # SenderCTArgs: dest_noc_x, dest_noc_y, data_size_bytes, receiver_semaphore_id
         # Plus grid info for computing per-core offset
-        dkv_gather_src_num_pages = 1  # dkv matmul output tiles per core
+        dkv_gather_src_num_pages = dkv_matmul_out_w  # dkv matmul output tiles per core (must match matmul cb_push_back)
         dkv_gather_sender_named_compile_time_args = [
             ("dkv_gather_dest_noc_x", dkv_gather_dest_noc_core.x),
             ("dkv_gather_dest_noc_y", dkv_gather_dest_noc_core.y),

@@ -127,9 +127,13 @@ KERNEL_ENTRY {
 #if defined(COMPILE_FOR_NCRISC)
     // Setup sharded persistent buffers
     if constexpr (Core::is_dkv_matmul_core) {
-        // Matmul weights
-        constexpr uint32_t dkv_matmul_in1 = get_named_compile_time_arg_val("dkv_matmul_in1");
+        // Matmul activations (in0)
+        constexpr uint32_t dkv_matmul_in0 = get_named_compile_time_arg_val("dkv_matmul_in0");
         constexpr uint32_t dkv_matmul_k_num_tiles = get_named_compile_time_arg_val("dkv_matmul_k_num_tiles");
+        unified_kernels::setup_sharded_buffer(dkv_matmul_in0, dkv_matmul_k_num_tiles);
+
+        // Matmul weights (in1)
+        constexpr uint32_t dkv_matmul_in1 = get_named_compile_time_arg_val("dkv_matmul_in1");
         constexpr uint32_t dkv_matmul_out_w_per_core = get_named_compile_time_arg_val("dkv_matmul_out_w_per_core");
         unified_kernels::setup_sharded_buffer(dkv_matmul_in1, dkv_matmul_k_num_tiles * dkv_matmul_out_w_per_core);
     }
@@ -149,6 +153,7 @@ KERNEL_ENTRY {
     // Gather: dkv matmul cores (senders) -> input core (receiver)
     // NCRISC sends from knope grid of dkv matmul cores, BRISC receives on rmsnorm grid, TRISC no-op
     // ========================================================================
+    DPRINT << "DKV_GATHER" << ENDL();
     {
         DeviceZoneScopedN("DKV_GATHER");
         deepseek_b1_ops::Gather::Op<Core::is_knope_core, Core::is_kv_rmsnorm_core, true> dkv_gather;
@@ -157,6 +162,7 @@ KERNEL_ENTRY {
 
     // ========================================================================
     // RMSNorm: Apply RMSNorm to the gathered data
+    DPRINT << "KV_RMSNORM" << ENDL();
     {
         DeviceZoneScopedN("KV_RMSNORM");
         deepseek_b1_ops::RMSNorm::Op<KV_RMSNormCTArgs, Core::is_dkv_matmul_core, true> kv_rmsnorm;
