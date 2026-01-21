@@ -290,14 +290,26 @@ FORCE_INLINE void write_downstream(
 }
 
 // If prefetcher must stall after this fetch, wait for data to come back, and move to stalled state.
-FORCE_INLINE void barrier_and_stall(uint32_t& pending_read_size, uint32_t& fence, uint32_t& cmd_ptr) {
-    noc_async_read_barrier();
+// trid: transaction ID (0-15). If trid is in range 0-15, use trid barrier. Otherwise use regular barrier.
+FORCE_INLINE void barrier_and_stall(uint32_t& pending_read_size, uint32_t& fence, uint32_t& cmd_ptr, uint32_t trid = 16) {
+    DPRINT << "barrier_and_stall: ENTER trid=" << trid << " pending_read_size=" << pending_read_size 
+           << " fence=" << fence << " cmd_ptr=" << cmd_ptr << ENDL();
+    if (trid <= 15) {
+        DPRINT << "barrier_and_stall: BARRIER_WITH_TRID trid=" << trid << ENDL();
+        noc_async_read_barrier_with_trid(trid);
+    } else {
+        DPRINT << "barrier_and_stall: BARRIER_REGULAR (trid=" << trid << " out of range)" << ENDL();
+        noc_async_read_barrier();
+    }
     if (fence < cmd_ptr) {
+        DPRINT << "barrier_and_stall: ADJUST cmd_ptr fence=" << fence << " cmd_ptr=" << cmd_ptr << " -> " << fence << ENDL();
         cmd_ptr = fence;
     }
     fence += pending_read_size;
+    DPRINT << "barrier_and_stall: UPDATE fence=" << fence << " (added " << pending_read_size << ")" << ENDL();
     pending_read_size = 0;
     stall_state = STALLED;
+    DPRINT << "barrier_and_stall: EXIT fence=" << fence << " cmd_ptr=" << cmd_ptr << " stall_state=STALLED" << ENDL();
 }
 
 template <uint32_t preamble_size>
@@ -306,8 +318,12 @@ FORCE_INLINE uint32_t read_from_pcie(
     uint32_t& fence,
     uint32_t& pcie_read_ptr,
     uint32_t cmd_ptr,
-    uint32_t size) {
+    uint32_t size,
+    uint32_t& trid) {
     uint32_t pending_read_size = 0;
+    DPRINT << "read_from_pcie: ENTER trid=" << trid << " size=" << size << " preamble_size=" << preamble_size 
+           << " fence=" << fence << " cmd_ptr=" << cmd_ptr << " pcie_read_ptr=" << pcie_read_ptr << ENDL();
+    
     // Wrap cmddat_q
     if (fence + size + preamble_size > cmddat_q_end) {
         // only wrap if there are no commands ready, otherwise we'll leave some on the floor
@@ -315,21 +331,30 @@ FORCE_INLINE uint32_t read_from_pcie(
         if (cmd_ptr != fence) {
             // No pending reads, since the location of fence cannot be moved due to unread commands
             // in the cmddat_q -> reads cannot be issued to fill the queue.
+            DPRINT << "read_from_pcie: EARLY_EXIT (cmddat_q wrap, cmd_ptr != fence) trid=" << trid 
+                   << " fence=" << fence << " cmd_ptr=" << cmd_ptr << ENDL();
             return pending_read_size;
         }
+        DPRINT << "read_from_pcie: WRAP cmddat_q fence=" << fence << " -> " << cmddat_q_base << ENDL();
         fence = cmddat_q_base;
     }
 
     // Wrap pcie/hugepage
     if (pcie_read_ptr + size > pcie_base + pcie_size) {
+        DPRINT << "read_from_pcie: WRAP pcie pcie_read_ptr=" << pcie_read_ptr << " -> " << pcie_base << ENDL();
         pcie_read_ptr = pcie_base;
     }
 
     uint64_t host_src_addr = pcie_noc_xy | pcie_read_ptr;
-    // DPRINT << "read_from_pcie: " << fence + preamble_size << " " << pcie_read_ptr << ENDL();
-    noc_async_read(host_src_addr, fence + preamble_size, size);
+    uint32_t dst_addr = fence + preamble_size;
+    DPRINT << "read_from_pcie: ISSUE_READ trid=" << trid << " host_src_addr=" << host_src_addr 
+           << " dst_addr=" << dst_addr << " size=" << size << ENDL();
+    noc_async_read_set_trid(trid);
+    noc_async_read(host_src_addr, dst_addr, size);
     pending_read_size = size + preamble_size;
     pcie_read_ptr += size;
+    DPRINT << "read_from_pcie: READ_ISSUED trid=" << trid << " pending_read_size=" << pending_read_size 
+           << " new_pcie_read_ptr=" << pcie_read_ptr << " new_fence=" << fence << ENDL();
 
     *prefetch_q_rd_ptr = 0;
 
@@ -369,17 +394,24 @@ FORCE_INLINE uint32_t read_from_pcie(
 template <uint32_t preamble_size>
 void fetch_q_get_cmds(uint32_t& fence, uint32_t& cmd_ptr, uint32_t& pcie_read_ptr) {
     static uint32_t pending_read_size = 0;
+    static uint32_t pending_read_trid = 0;
+    static uint32_t next_trid = 0;
     static volatile tt_l1_ptr prefetch_q_entry_type* prefetch_q_rd_ptr =
         (volatile tt_l1_ptr prefetch_q_entry_type*)prefetch_q_base;
     constexpr uint32_t prefetch_q_msb_mask = 1u << (sizeof(prefetch_q_entry_type) * CHAR_BIT - 1);
 
+    DPRINT << "fetch_q_get_cmds: ENTER stall_state=" << stall_state << " pending_read_size=" << pending_read_size 
+           << " pending_read_trid=" << pending_read_trid << " next_trid=" << next_trid 
+           << " fence=" << fence << " cmd_ptr=" << cmd_ptr << ENDL();
+    
     if (stall_state == STALLED) {
         ASSERT(pending_read_size == 0);  // Before stalling, fetch must have been completed.
+        DPRINT << "fetch_q_get_cmds: EXIT (STALLED)" << ENDL();
         return;
     }
 
-    // DPRINT << "fetch_q_get_cmds: " << cmd_ptr << " " << fence << ENDL();
     if (fence < cmd_ptr) {
+        DPRINT << "fetch_q_get_cmds: ADJUST cmd_ptr fence=" << fence << " cmd_ptr=" << cmd_ptr << " -> " << fence << ENDL();
         cmd_ptr = fence;
     }
 
@@ -389,56 +421,90 @@ void fetch_q_get_cmds(uint32_t& fence, uint32_t& cmd_ptr, uint32_t& pcie_read_pt
     uint32_t fetch_size = (prefetch_q_rd_ptr_local & ~prefetch_q_msb_mask) << prefetch_q_log_minsize;
     bool stall_flag = (prefetch_q_rd_ptr_local & prefetch_q_msb_mask) != 0;
     stall_state = static_cast<StallState>(stall_flag << 1);  // NOT_STALLED -> STALL_NEXT if stall_flag is set
+    
+    DPRINT << "fetch_q_get_cmds: STATE cmd_ready=" << cmd_ready << " fetch_size=" << fetch_size 
+           << " stall_flag=" << stall_flag << " stall_state=" << stall_state << ENDL();
 
     if (fetch_size != 0 && pending_read_size == 0) {
-        pending_read_size = read_from_pcie<preamble_size>(prefetch_q_rd_ptr, fence, pcie_read_ptr, cmd_ptr, fetch_size);
+        pending_read_trid = next_trid;
+        DPRINT << "fetch_q_get_cmds: CALL read_from_pcie trid=" << pending_read_trid << " fetch_size=" << fetch_size << ENDL();
+        pending_read_size = read_from_pcie<preamble_size>(prefetch_q_rd_ptr, fence, pcie_read_ptr, cmd_ptr, fetch_size, pending_read_trid);
+        if (pending_read_size != 0) {
+            next_trid = (next_trid + 1) & 0xF;  // Cycle through 0-15
+            DPRINT << "fetch_q_get_cmds: READ_ISSUED pending_read_size=" << pending_read_size 
+                   << " pending_read_trid=" << pending_read_trid << " next_trid=" << next_trid << ENDL();
+        } else {
+            DPRINT << "fetch_q_get_cmds: READ_FAILED (pending_read_size=0) trid=" << pending_read_trid << ENDL();
+        }
         if (stall_state == STALL_NEXT && pending_read_size != 0) {
             // No pending reads -> stall_state can be set to STALLED, since the read to the cmd
             // that initiated the stall has been issued.
             // exec_buf is the first command being fetched and should be offset
             // by preamble size. After ensuring that the exec_buf command has been read (barrier),
             // exit.
-            barrier_and_stall(pending_read_size, fence, cmd_ptr);  // STALL_NEXT -> STALLED
+            DPRINT << "fetch_q_get_cmds: STALL_NEXT -> calling barrier_and_stall trid=" << pending_read_trid << ENDL();
+            barrier_and_stall(pending_read_size, fence, cmd_ptr, pending_read_trid);  // STALL_NEXT -> STALLED
             return;
         }
     }
     if (!cmd_ready) {
         if (pending_read_size != 0) {
-            noc_async_read_barrier();
+            DPRINT << "fetch_q_get_cmds: BARRIER_WAIT trid=" << pending_read_trid << " pending_read_size=" << pending_read_size << ENDL();
+            noc_async_read_barrier_with_trid(pending_read_trid);
             // wrap the cmddat_q
             if (fence < cmd_ptr) {
                 cmd_ptr = fence;
             }
 
             fence += pending_read_size;
+            DPRINT << "fetch_q_get_cmds: BARRIER_DONE fence=" << fence << " (added " << pending_read_size << ")" << ENDL();
             pending_read_size = 0;
+            pending_read_trid = 0;
 
             // After the stall, re-check the host
             prefetch_q_rd_ptr_local = *prefetch_q_rd_ptr;
             fetch_size = (prefetch_q_rd_ptr_local & ~prefetch_q_msb_mask) << prefetch_q_log_minsize;
+            DPRINT << "fetch_q_get_cmds: RE_CHECK fetch_size=" << fetch_size << ENDL();
 
             if (fetch_size != 0) {
                 stall_flag = (prefetch_q_rd_ptr_local & prefetch_q_msb_mask) != 0;
                 stall_state =
                     static_cast<StallState>(stall_flag << 1);  // NOT_STALLED -> STALL_NEXT if stall_flag is set
+                DPRINT << "fetch_q_get_cmds: RE_CHECK stall_flag=" << stall_flag << " stall_state=" << stall_state << ENDL();
 
                 if (stall_state == STALL_NEXT) {
                     // If the prefetcher state reached here, it is issuing a read to the same "slot", since for exec_buf
                     // commands we will insert a read barrier. Hence, the exec_buf command will be concatenated to a
                     // previous command, and should not be offset by preamble size.
+                    pending_read_trid = next_trid;
+                    DPRINT << "fetch_q_get_cmds: STALL_NEXT calling read_from_pcie<0> trid=" << pending_read_trid 
+                           << " fetch_size=" << fetch_size << ENDL();
                     pending_read_size = read_from_pcie<0>(
-                        prefetch_q_rd_ptr, fence, pcie_read_ptr, cmd_ptr, fetch_size);
+                        prefetch_q_rd_ptr, fence, pcie_read_ptr, cmd_ptr, fetch_size, pending_read_trid);
                     if (pending_read_size != 0) {
                         // if pending_read_size == 0 read_from_pcie early exited, due to a wrap, i.e. the exec_buf cmd
                         // is at a wrapped location, and a read to it could not be issued, since there are existing
                         // commands in the cmddat_q. Only move the stall_state to stalled if the read to the cmd that
                         // initiated the stall was issued
+                        DPRINT << "fetch_q_get_cmds: STALL_NEXT read issued, calling barrier_and_stall trid=" << pending_read_trid << ENDL();
                         barrier_and_stall(
-                            pending_read_size, fence, cmd_ptr);  // STALL_NEXT -> STALLED
+                            pending_read_size, fence, cmd_ptr, pending_read_trid);  // STALL_NEXT -> STALLED
+                    } else {
+                        DPRINT << "fetch_q_get_cmds: STALL_NEXT read failed (pending_read_size=0) trid=" << pending_read_trid << ENDL();
                     }
                 } else {
+                    pending_read_trid = next_trid;
+                    DPRINT << "fetch_q_get_cmds: RE_CHECK calling read_from_pcie<preamble_size> trid=" << pending_read_trid 
+                           << " fetch_size=" << fetch_size << ENDL();
                     pending_read_size = read_from_pcie<preamble_size>(
-                        prefetch_q_rd_ptr, fence, pcie_read_ptr, cmd_ptr, fetch_size);
+                        prefetch_q_rd_ptr, fence, pcie_read_ptr, cmd_ptr, fetch_size, pending_read_trid);
+                    if (pending_read_size != 0) {
+                        next_trid = (next_trid + 1) & 0xF;  // Cycle through 0-15
+                        DPRINT << "fetch_q_get_cmds: RE_CHECK read issued pending_read_size=" << pending_read_size 
+                               << " next_trid=" << next_trid << ENDL();
+                    } else {
+                        DPRINT << "fetch_q_get_cmds: RE_CHECK read failed (pending_read_size=0) trid=" << pending_read_trid << ENDL();
+                    }
                 }
             }
         } else {
