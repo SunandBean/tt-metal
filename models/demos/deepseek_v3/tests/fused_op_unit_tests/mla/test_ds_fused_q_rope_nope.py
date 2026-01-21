@@ -14,6 +14,7 @@ from loguru import logger
 import ttnn
 from models.common.utility_functions import comp_pcc, profiler
 from models.demos.deepseek_v3.reference.modeling_deepseek import apply_rotary_pos_emb
+from models.demos.deepseek_v3.tt.ccl import CCL
 from models.demos.deepseek_v3.tt.rope import get_cos_sin_matrix
 from models.demos.deepseek_v3.utils.config_helpers import USERS_PER_ROW, even_int_div, sub_state_dict
 from models.demos.deepseek_v3.utils.run_config import create_run_config
@@ -92,6 +93,8 @@ def ds_fused_q_rope_nope_ttnn(
     # TODO: Add prefill case.
     if mode == "decode":
         bsz = q_input.shape[2]
+        print(f"q_input shape: {q_input.shape}")
+        print(f"cfg['wq_b'] shape: {cfg['wq_b']['input_tensor_b'].shape}")
         tt_q = ttnn.linear(q_input, **cfg["wq_b"])
         tt_q = ttnn.reshape(tt_q, (bsz, 1, num_heads_local, qk_head_dim))
 
@@ -101,6 +104,8 @@ def ds_fused_q_rope_nope_ttnn(
         )
 
         tt_q_nope = ttnn.permute(tt_q_nope, (1, 2, 0, 3))
+        print(f"tt_q_nope shape: {tt_q_nope.shape}")
+        print(f"cfg['wkv_b1'] shape: {cfg['wkv_b1']['input_tensor_b'].shape}")
         tt_q_nope = ttnn.linear(tt_q_nope, **cfg["wkv_b1"])
         tt_q_nope = ttnn.permute(tt_q_nope, (0, 2, 1, 3))
 
@@ -291,26 +296,64 @@ def _collect_device_perf(
     return op_stats, total_kernel_ns, total_op_to_op_ns
 
 
-@pytest.mark.parametrize(
-    "mode, seq_len, expected_pcc, expected_atol, expected_rtol, expected_perf_us",
-    [
-        # TODO: Replace expected_perf_us baselines with theoretical targets.
-        ("decode", 1, 0.999929, 0.2, 0.2, 1768.637),
-    ],
-)
-@pytest.mark.parametrize("program_cache_enabled", [True, False], ids=["program_cache", "no_program_cache"])
-@pytest.mark.parametrize("trace_mode", [False, True], ids=["eager", "trace"])
-@pytest.mark.parametrize(
-    "device_params",
-    [
-        {
-            "fabric_config": ttnn.FabricConfig.FABRIC_1D,
-            "trace_region_size": 4194304,
-        }
-    ],
-    indirect=True,
-)
-def test_ds_fused_q_rope_nope(
+def _build_module_state_dict(state_dict: dict, hf_config_short, use_real_weights: bool) -> dict:
+    module_path = "model.layers.0.self_attn"
+    module_state_dict = sub_state_dict(state_dict, module_path + ".")
+    if use_real_weights:
+        return module_state_dict
+    module_state_dict = dict(module_state_dict)
+    q_b_weight_shape = module_state_dict["q_b_proj.weight"].shape
+    kv_b_weight_shape = module_state_dict["kv_b_proj.weight"].shape
+
+    random_scale = 0.02
+    module_state_dict["q_b_proj.weight"] = (torch.randn(q_b_weight_shape, dtype=torch.bfloat16) * random_scale).to(
+        torch.float8_e4m3fn
+    )
+    module_state_dict["kv_b_proj.weight"] = (torch.randn(kv_b_weight_shape, dtype=torch.bfloat16) * random_scale).to(
+        torch.float8_e4m3fn
+    )
+    module_state_dict["q_b_proj.weight_scale_inv"] = torch.ones_like(module_state_dict["q_b_proj.weight_scale_inv"])
+    module_state_dict["kv_b_proj.weight_scale_inv"] = torch.ones_like(module_state_dict["kv_b_proj.weight_scale_inv"])
+    return module_state_dict
+
+
+def _build_run_config(
+    hf_config_short,
+    module_state_dict: dict,
+    cache_path,
+    mesh_device: ttnn.MeshDevice,
+    force_recalculate_weight_config: bool,
+    mode: str,
+    ccl: CCL,
+    use_real_weights: bool,
+) -> dict:
+    from models.demos.deepseek_v3.tt.mla.mla1d import MLA1D
+
+    if use_real_weights:
+        effective_cache_path = cache_path
+        force_recalculate = force_recalculate_weight_config
+    else:
+        effective_cache_path = cache_path / "tests_cache_random"
+        force_recalculate = True
+
+    weight_config = get_test_weight_config(
+        MLA1D,
+        hf_config_short,
+        (module_state_dict,) * mesh_device.shape[0],
+        effective_cache_path,
+        mesh_device,
+        force_recalculate,
+    )
+    model_config = get_model_config(MLA1D, mode, hf_config_short, mesh_device)
+    model_state = {
+        "mesh_device": mesh_device,
+        "mesh_shape": mesh_device.shape,
+        "ccl": ccl,
+    }
+    return create_run_config(model_config, weight_config, model_state)
+
+
+def _run_ds_fused_q_rope_nope_test(
     mode,
     seq_len,
     expected_pcc,
@@ -319,13 +362,16 @@ def test_ds_fused_q_rope_nope(
     expected_perf_us,
     program_cache_enabled,
     trace_mode,
+    use_real_weights,
     hf_config_short,
     cache_path,
     mesh_device,
     ccl,
     force_recalculate_weight_config,
-    set_deterministic_env,
     state_dict,
+    step_prefix: str,
+    run_config_override: dict | None = None,
+    num_heads_local_override: int | None = None,
 ):
     if mode == "decode":
         assert seq_len == 1, "Decode only supports seq_len=1"
@@ -338,30 +384,22 @@ def test_ds_fused_q_rope_nope(
     if not program_cache_enabled:
         mesh_device.disable_and_clear_program_cache()
 
-    module_path = "model.layers.0.self_attn"
-    module_state_dict = sub_state_dict(state_dict, module_path + ".")
+    module_state_dict = _build_module_state_dict(state_dict, hf_config_short, use_real_weights)
     dequant_state_dict = dequantize_state_dict(module_state_dict, hf_config_short)
 
     q_b_weight = dequant_state_dict["q_b_proj.weight"]
     kv_b_weight = dequant_state_dict["kv_b_proj.weight"]
 
-    from models.demos.deepseek_v3.tt.mla.mla1d import MLA1D
-
-    weight_config = get_test_weight_config(
-        MLA1D,
+    run_config = run_config_override or _build_run_config(
         hf_config_short,
-        (module_state_dict,) * mesh_device.shape[0],
+        module_state_dict,
         cache_path,
         mesh_device,
         force_recalculate_weight_config,
+        mode,
+        ccl,
+        use_real_weights,
     )
-    model_config = get_model_config(MLA1D, mode, hf_config_short, mesh_device)
-    model_state = {
-        "mesh_device": mesh_device,
-        "mesh_shape": mesh_device.shape,
-        "ccl": ccl,
-    }
-    run_config = create_run_config(model_config, weight_config, model_state)
 
     batch_size = USERS_PER_ROW
     seq_or_bsz = batch_size
@@ -382,7 +420,7 @@ def test_ds_fused_q_rope_nope(
     qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
     kv_lora_rank = hf_config_short.kv_lora_rank
     num_heads = hf_config_short.num_attention_heads
-    num_heads_local = even_int_div(num_heads, mesh_device.shape[1])
+    num_heads_local = num_heads_local_override or even_int_div(num_heads, mesh_device.shape[1])
 
     position_ids = torch.randint(0, hf_config_short.max_seq_len - 1, (batch_size,))
     rope_tensors = get_rope_tensors(hf_config_short, batch_size, seq_len, position_ids, mesh_device)
@@ -419,7 +457,7 @@ def test_ds_fused_q_rope_nope(
         benchmark_data = BenchmarkData()
         trace_suffix = "trace" if trace_mode else "no_trace"
         cache_suffix = "pcache" if program_cache_enabled else "no_pcache"
-        step_name = f"ds_fused_q_rope_nope_{mode}_seq{seq_len}_{trace_suffix}_{cache_suffix}"
+        step_name = f"{step_prefix}_{mode}_seq{seq_len}_{trace_suffix}_{cache_suffix}"
 
         perf_profiler.start("run")
         perf_profiler.start(step_name)
@@ -510,6 +548,177 @@ def test_ds_fused_q_rope_nope(
 
 
 @pytest.mark.parametrize(
+    "mode, seq_len, expected_pcc, expected_atol, expected_rtol, expected_perf_us",
+    [
+        # TODO: Replace expected_perf_us baselines with theoretical targets.
+        ("decode", 1, 0.99992, 0.2, 0.2, 1768.637),
+    ],
+)
+@pytest.mark.parametrize("program_cache_enabled", [True, False], ids=["program_cache", "no_program_cache"])
+@pytest.mark.parametrize("trace_mode", [False, True], ids=["eager", "trace"])
+@pytest.mark.parametrize("use_real_weights", [True, False], ids=["real_weights", "random_weights"])
+@pytest.mark.parametrize(
+    "device_params",
+    [
+        {
+            "fabric_config": ttnn.FabricConfig.FABRIC_1D,
+            "trace_region_size": 4194304,
+        }
+    ],
+    indirect=True,
+)
+def test_ds_fused_q_rope_nope(
+    mode,
+    seq_len,
+    expected_pcc,
+    expected_atol,
+    expected_rtol,
+    expected_perf_us,
+    program_cache_enabled,
+    trace_mode,
+    use_real_weights,
+    hf_config_short,
+    cache_path,
+    mesh_device,
+    ccl,
+    force_recalculate_weight_config,
+    set_deterministic_env,
+    state_dict,
+):
+    _run_ds_fused_q_rope_nope_test(
+        mode,
+        seq_len,
+        expected_pcc,
+        expected_atol,
+        expected_rtol,
+        expected_perf_us,
+        program_cache_enabled,
+        trace_mode,
+        use_real_weights,
+        hf_config_short,
+        cache_path,
+        mesh_device,
+        ccl,
+        force_recalculate_weight_config,
+        state_dict,
+        "ds_fused_q_rope_nope",
+    )
+
+
+@pytest.mark.parametrize(
+    "mode, seq_len, expected_pcc, expected_atol, expected_rtol, expected_perf_us",
+    [
+        # TODO: Replace expected_perf_us baselines with theoretical targets.
+        ("decode", 1, 0.99992, 0.2, 0.2, 1768.637),
+    ],
+)
+@pytest.mark.parametrize("program_cache_enabled", [True, False], ids=["program_cache", "no_program_cache"])
+@pytest.mark.parametrize("trace_mode", [False, True], ids=["eager", "trace"])
+@pytest.mark.parametrize("use_real_weights", [True, False], ids=["real_weights", "random_weights"])
+@pytest.mark.parametrize(
+    "device_params",
+    [
+        {
+            "fabric_config": ttnn.FabricConfig.FABRIC_1D,
+            "trace_region_size": 4194304,
+        }
+    ],
+    indirect=True,
+)
+def test_ds_fused_q_rope_nope_single_device(
+    mode,
+    seq_len,
+    expected_pcc,
+    expected_atol,
+    expected_rtol,
+    expected_perf_us,
+    program_cache_enabled,
+    trace_mode,
+    use_real_weights,
+    hf_config_short,
+    cache_path,
+    mesh_device,
+    ccl,
+    force_recalculate_weight_config,
+    set_deterministic_env,
+    state_dict,
+):
+    if mesh_device.get_num_devices() == 1:
+        single_device_mesh = mesh_device
+    else:
+        single_device_mesh = mesh_device.create_submeshes(ttnn.MeshShape(1, 1))[0]
+
+    module_state_dict = _build_module_state_dict(state_dict, hf_config_short, use_real_weights)
+    qk_nope_head_dim = hf_config_short.qk_nope_head_dim
+    qk_rope_head_dim = hf_config_short.qk_rope_head_dim
+    qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+    num_heads = hf_config_short.num_attention_heads
+    num_heads_local_full = even_int_div(num_heads, mesh_device.shape[1])
+    run_config_full = _build_run_config(
+        hf_config_short,
+        module_state_dict,
+        cache_path,
+        mesh_device,
+        force_recalculate_weight_config,
+        mode,
+        ccl=ccl,
+        use_real_weights=use_real_weights,
+    )
+    wq_b_full = run_config_full["wq_b"]["input_tensor_b"]
+    wkv_b1_full = run_config_full["wkv_b1"]["input_tensor_b"]
+    wq_b_shard = ttnn.to_torch(ttnn.get_device_tensors(wq_b_full)[0])
+    wkv_b1_shard = ttnn.to_torch(ttnn.get_device_tensors(wkv_b1_full)[0])
+    # Per-device matmul input_tensor_b shapes verified from ops_perf_report (decode, seq_len=1).
+    expected_wq_b_tail = (hf_config_short.q_lora_rank, num_heads_local_full * qk_head_dim)
+    expected_wkv_b1_tail = (num_heads_local_full, qk_nope_head_dim, hf_config_short.kv_lora_rank)
+    assert (
+        wq_b_shard.shape[-2:] == expected_wq_b_tail
+    ), f"wq_b shard tail shape {tuple(wq_b_shard.shape)} != expected *{expected_wq_b_tail}"
+    assert (
+        wkv_b1_shard.shape[-3:] == expected_wkv_b1_tail
+    ), f"wkv_b1 shard tail shape {tuple(wkv_b1_shard.shape)} != expected *{expected_wkv_b1_tail}"
+
+    single_device_ccl = CCL(single_device_mesh)
+    run_config_single = dict(run_config_full)
+    run_config_single["wq_b"] = dict(run_config_full["wq_b"])
+    run_config_single["wkv_b1"] = dict(run_config_full["wkv_b1"])
+    run_config_single["wq_b"]["input_tensor_b"] = ttnn.from_torch(
+        wq_b_shard,
+        device=single_device_mesh,
+        dtype=ttnn.bfloat8_b,
+        layout=ttnn.TILE_LAYOUT,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    run_config_single["wkv_b1"]["input_tensor_b"] = ttnn.from_torch(
+        wkv_b1_shard,
+        device=single_device_mesh,
+        dtype=ttnn.bfloat8_b,
+        layout=ttnn.TILE_LAYOUT,
+        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+    )
+    _run_ds_fused_q_rope_nope_test(
+        mode,
+        seq_len,
+        expected_pcc,
+        expected_atol,
+        expected_rtol,
+        expected_perf_us,
+        program_cache_enabled,
+        trace_mode,
+        use_real_weights,
+        hf_config_short,
+        cache_path,
+        single_device_mesh,
+        single_device_ccl,
+        force_recalculate_weight_config,
+        state_dict,
+        "ds_fused_q_rope_nope_single_device",
+        run_config_override=run_config_single,
+        num_heads_local_override=num_heads_local_full,
+    )
+
+
+@pytest.mark.parametrize(
     "mode, seq_len",
     [
         ("decode", 1),
@@ -530,9 +739,9 @@ def test_ds_fused_q_rope_nope_device_perf(mode, seq_len):
     perf_profiler = BenchmarkProfiler()
     benchmark_data = BenchmarkData()
     step_name = f"ds_fused_q_rope_nope_device_perf_{mode}_seq{seq_len}"
-    test_path = "models/demos/deepseek_v3/tests/fused_op_unit_tests/test_ds_fused_q_rope_nope.py"
+    test_path = "models/demos/deepseek_v3/tests/fused_op_unit_tests/mla/test_ds_fused_q_rope_nope.py"
     trace_filter = "trace" if mode == "decode" else "eager"
-    expr = f"program_cache and not no_program_cache and {trace_filter} and {mode} and {seq_len}"
+    expr = f"program_cache and not no_program_cache and {trace_filter} and {mode} and {seq_len} and real_weights"
     command = f'pytest {test_path}::test_ds_fused_q_rope_nope -k "{expr}"'
 
     perf_profiler.start("run")
@@ -591,5 +800,89 @@ def test_ds_fused_q_rope_nope_device_perf(mode, seq_len):
         run_type="deepseek_v3_fused_ops",
         ml_model_name="deepseek-v3",
         batch_size=batch_size,
+        input_sequence_length=seq_len,
+    )
+
+
+@pytest.mark.parametrize(
+    "mode, seq_len",
+    [
+        ("decode", 1),
+    ],
+)
+def test_ds_fused_q_rope_nope_single_device_device_perf(mode, seq_len):
+    if mode == "decode":
+        assert seq_len == 1, "Decode only supports seq_len=1"
+    else:
+        raise ValueError(f"Unsupported mode {mode}; TODO: Add prefill case.")
+
+    requested_system_name = os.getenv("MESH_DEVICE")
+    if requested_system_name is None:
+        raise ValueError("Environment variable $MESH_DEVICE is not set. Please set it to T3K, DUAL, QUAD, or TG.")
+
+    perf_profiler = BenchmarkProfiler()
+    benchmark_data = BenchmarkData()
+    step_name = f"ds_fused_q_rope_nope_single_device_device_perf_{mode}_seq{seq_len}"
+    test_path = "models/demos/deepseek_v3/tests/fused_op_unit_tests/mla/test_ds_fused_q_rope_nope.py"
+    trace_filter = "trace" if mode == "decode" else "eager"
+    expr = f"program_cache and not no_program_cache and {trace_filter} and {mode} and {seq_len} and real_weights"
+    command = f'pytest {test_path}::test_ds_fused_q_rope_nope_single_device -k "{expr}"'
+
+    perf_profiler.start("run")
+    perf_profiler.start(step_name)
+    os.environ[DEVICE_PERF_ENV_VAR] = "1"
+    op_stats, total_kernel_ns, total_op_to_op_ns = _collect_device_perf(
+        command,
+        subdir="deepseek_v3_fused_ops_device_perf",
+        warmup_iters=0,
+        use_signposts=True,
+    )
+    os.environ.pop(DEVICE_PERF_ENV_VAR, None)
+    perf_profiler.end(step_name)
+    perf_profiler.end("run")
+
+    assert op_stats, "No device perf stats captured."
+    total_kernel_us = total_kernel_ns / 1000.0
+    total_op_to_op_us = total_op_to_op_ns / 1000.0
+    logger.info(f"Device perf per-op averages (ns): {json.dumps(op_stats, indent=2)}")
+    logger.info(f"Device perf totals: kernel={total_kernel_us:.3f} us, op_to_op={total_op_to_op_us:.3f} us")
+    assert total_kernel_ns > 0, "Total kernel duration must be positive."
+    assert total_op_to_op_ns >= 0, "Total op-to-op latency must be non-negative."
+    targets = DEVICE_PERF_TARGETS_US.get((mode, seq_len))
+    if targets is None:
+        logger.warning("No device perf targets configured; skipping perf assertions.")
+    else:
+        kernel_target_us = targets["kernel"]
+        op_to_op_target_us = targets["op_to_op"]
+        kernel_limit_us = kernel_target_us * (1 + DEVICE_PERF_MARGIN)
+        op_to_op_limit_us = op_to_op_target_us * (1 + DEVICE_PERF_MARGIN)
+        assert (
+            total_kernel_us <= kernel_limit_us
+        ), f"Kernel perf regression: {total_kernel_us:.3f}us exceeds {kernel_target_us:.3f}us (+{DEVICE_PERF_MARGIN:.0%})"
+        assert (
+            total_op_to_op_us <= op_to_op_limit_us
+        ), f"Op-to-op perf regression: {total_op_to_op_us:.3f}us exceeds {op_to_op_target_us:.3f}us (+{DEVICE_PERF_MARGIN:.0%})"
+
+    benchmark_data.add_measurement(
+        perf_profiler,
+        0,
+        step_name,
+        "total_kernel_duration_us",
+        total_kernel_us,
+        target=targets["kernel"] if targets else None,
+    )
+    benchmark_data.add_measurement(
+        perf_profiler,
+        0,
+        step_name,
+        "total_op_to_op_latency_us",
+        total_op_to_op_us,
+        target=targets["op_to_op"] if targets else None,
+    )
+    benchmark_data.save_partial_run_json(
+        perf_profiler,
+        run_type="deepseek_v3_fused_ops",
+        ml_model_name="deepseek-v3",
+        batch_size=USERS_PER_ROW,
         input_sequence_length=seq_len,
     )

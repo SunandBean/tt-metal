@@ -50,8 +50,9 @@ Follow these steps to add a new fused op unit test:
     6. Run the single device test and verify that both the PCC and the perf are the same as for the multi device test.
 11. Add a single device test for device performance, see step 10 for how to do that.
 12. If single device tests are not skipped, *verify* the single device tests by running the single device, device perf test that generated the csv file and compare it to the multi device perf csv. All shapes must match, create a helper script to verify that.
-13. Print the summary for all verification steps clearly representing the results and the links to logs for all successful verification steps.
-14. List anything that was unexpected and/or any workarouds you needed to make the fused op unit test work.
+13. Add a row in the table in models/demos/deepseek_v3/tests/fused_op_unit_tests/README.md for the newly added test and fill in the cells; read the instructions in the readme for interpretation of the features.
+14. Print the summary for all verification steps clearly representing the results and the links to logs for all successful verification steps.
+15. List anything that was unexpected and/or any workarouds you needed to make the fused op unit test work.
 
 Notes on performance measurements:
 - Performance measurements use three metrics: e2e_duration, kernel_duration, op_to_op_latency
