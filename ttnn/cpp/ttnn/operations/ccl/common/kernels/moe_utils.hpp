@@ -682,18 +682,11 @@ inline void fabric_send_chip_sparse_multicast_noc_unicast_1d_in_direction(
 // Eg. Going West (3->0) or North (2->0)
 template <tt::tt_fabric::Topology Topology, uint32_t AxisSize>
 inline uint32_t calculate_hops_direction_enforced_1D(uint32_t src_coord, uint32_t dest_coord, Polarity polarity) {
-    if constexpr (has_wrap_around<Topology>()) {
-        return directional_wrap_distance<AxisSize>(src_coord, dest_coord, polarity);
-    } else {
-        uint32_t distance = (polarity == Polarity::POSITIVE) ? (dest_coord - src_coord) : (src_coord - dest_coord);
-        // If wraparound is not enabled, then distance can never be negative.
-        // Eg. going "forward" from 3 to 2 is impossible.
-        // TODO: Add an actual error/assertion here
-        // if (distance < 0) {
-        //     ASSERT(false);
-        // }
-        return distance;
-    }
+    // Currently this function has only been tested for 1D Ring topology.
+    static_assert(
+        has_wrap_around<Topology>(),
+        "calculate_hops_direction_enforced_1D has only been tested for 1D topologies with wraparound links");
+    return directional_wrap_distance<AxisSize>(src_coord, dest_coord, polarity);
 }
 
 // Given a list of destinations, generates a hop mask relative to the source chip
