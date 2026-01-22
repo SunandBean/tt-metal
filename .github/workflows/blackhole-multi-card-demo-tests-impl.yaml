@@ -66,6 +66,7 @@ jobs:
       - arch-blackhole
       - "${{ inputs.runner-label }}"
       - "${{ inputs.extra-tag }}"
+      - f01cs01
     container:
       image: ${{ inputs.docker-image || 'docker-image-unresolved' }}
       env:
