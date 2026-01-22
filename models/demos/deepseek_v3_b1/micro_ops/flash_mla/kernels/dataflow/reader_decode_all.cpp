@@ -160,37 +160,36 @@ void kernel_main() {
         uint32_t k_start_tile_id = k_batch_offset + k_head_offset + k_chunk_offset;
 
         for (uint32_t k_chunk = k_chunk_start; k_chunk < k_chunk_end; ++k_chunk) {
-            // Read K chunk transposed
+            // Read K chunk in natural [Sk_chunk, DHt] order (no transpose)
+            // cb_matmul_blocks with transpose=true handles [N, K] layout
             uint64_t k_base_read_ptr;
             {
                 DeviceZoneScopedN("reader-k-read");
                 cb_reserve_back(cb_k_in, k_chunk_tiles);
                 uint32_t k_write_ptr = get_write_ptr(cb_k_in);
                 k_base_read_ptr = get_noc_addr(k_write_ptr);
-                for (uint32_t col = 0; col < DHt; ++col) {
-                    uint32_t k_tile_id = k_start_tile_id + col;
-                    for (uint32_t row = 0; row < Sk_chunk_t_dynamic; ++row) {
-                        noc_async_read_tile(k_tile_id, k_reader, k_write_ptr);
-                        k_tile_id += DHt;
-                        k_write_ptr += k_tile_bytes;
-                    }
+                uint32_t k_tile_id = k_start_tile_id;
+                for (uint32_t tile = 0; tile < k_chunk_tiles; ++tile) {
+                    noc_async_read_tile(k_tile_id, k_reader, k_write_ptr);
+                    k_tile_id++;
+                    k_write_ptr += k_tile_bytes;
                 }
                 noc_async_read_barrier();
                 cb_push_back(cb_k_in, k_chunk_tiles);
             }
 
-            // Read V chunk (transpose of K), from K's L1 buffer (MLA always reuses K for V)
+            // Read V chunk from K's L1 buffer (MLA reuses K for V)
+            // K is now stored as [Sk_chunk, DHt], so K[row, col] = row * DHt + col
             {
                 DeviceZoneScopedN("reader-v-read");
                 cb_reserve_back(cb_v_in, v_chunk_tiles);
                 uint32_t v_write_ptr = get_write_ptr(cb_v_in);
-                uint64_t k_read_ptr = k_base_read_ptr;
                 for (uint32_t row = 0; row < Sk_chunk_t_dynamic; ++row) {
-                    k_read_ptr = k_base_read_ptr + row * k_tile_bytes;
+                    uint64_t k_read_ptr = k_base_read_ptr + row * DHt * k_tile_bytes;  // Start of row
                     for (uint32_t col = 0; col < vDHt; ++col) {
                         noc_async_read(k_read_ptr, v_write_ptr, v_tile_bytes);
                         v_write_ptr += v_tile_bytes;
-                        k_read_ptr += Sk_chunk_t_dynamic * k_tile_bytes;
+                        k_read_ptr += k_tile_bytes;  // Next column (stride 1)
                     }
                 }
                 noc_async_read_barrier();

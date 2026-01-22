@@ -567,6 +567,10 @@ void move_block(uint32_t in_cb, uint32_t out_cb, uint32_t num_tiles) {
 
 /**
  * out_cb = in0_cb @ in1_cb
+ *
+ * @param transpose: If false, in1 is expected in [K, N] layout (row-major), no tile transpose.
+ *                   If true, in1 is in [N, K] layout and both layout indexing and tile-level
+ *                   transpose are applied.
  */
 ALWI void cb_matmul_blocks(
     const uint32_t& in0_cb,
@@ -586,12 +590,33 @@ ALWI void cb_matmul_blocks(
     const uint32_t& mask_cb,
     const uint32_t& zero_cb) {
     // precondition: in0_cb has M*K produced
-    // preconditino: in1_cb has K*N produced
+    // precondition: in1_cb has K*N produced (or N*K if transpose)
     // postcondition: in0_cb is full, in1_cb is empty
     // postcondition: out_cb has M*N produced
 
+    // For [K, N] layout (transpose=false): in1 tiles indexed as (k, n) -> k * N + n
+    //   - Inner loop (over K): stride by N to next K row
+    //   - Subblock offset (over N): stride by subblock_w
+    //   - MOP iterates over subblock_w with stride 1, which matches [K, N] layout
+    // For [N, K] layout (transpose=true): in1 tiles indexed as (n, k) -> n * K + k
+    //   - Inner loop (over K): stride by 1 to next K column
+    //   - Column offset (over N): stride by K to next N row
+    //   - MOP assumes stride 1, so we must call matmul_block per output column
+    const uint32_t in1_inner_stride = transpose ? 1 : N;
+    const uint32_t in1_subblock_stride = transpose ? subblock_w * K : subblock_w;
+    // When transpose=true, MOP's internal stride=1 is wrong for [N,K] layout.
+    // We call matmul_block with effective_subblock_w=1 and loop over columns explicitly.
+    const uint32_t effective_subblock_w = transpose ? 1 : subblock_w;
+    const uint32_t num_col_loops = transpose ? subblock_w : 1;
+    const uint32_t in1_col_stride = K;  // Stride between output columns in [N, K] layout
+
     mm_block_init_short(
-        in0_cb, in1_cb, transpose /*transpose*/, subblock_w /*ct_dim*/, subblock_h /*rt_dim*/, in0_block_w /*kt_dim*/);
+        in0_cb,
+        in1_cb,
+        transpose /*transpose*/,
+        effective_subblock_w /*ct_dim*/,
+        subblock_h /*rt_dim*/,
+        in0_block_w /*kt_dim*/);
 
     reconfig_data_format(in1_cb, in0_cb);
     {
@@ -601,41 +626,53 @@ ALWI void cb_matmul_blocks(
 
     uint32_t output_num_tiles = M * N;
     cb_reserve_back(out_cb, output_num_tiles);
-    uint32_t out_subblock_num_tiles = subblock_h * subblock_w;
     uint32_t in0_index_offset = 0;
 
     for (uint32_t in0_subblock = 0; in0_subblock < in0_num_subblocks; ++in0_subblock) {
         uint32_t in1_index_offset = 0;
 
         for (uint32_t in1_subblock = 0; in1_subblock < in1_num_subblocks; ++in1_subblock) {
-            tile_regs_acquire();
-            uint32_t dst_index = 0;
-            uint32_t in0_index = in0_index_offset;
-            uint32_t in1_index = in1_index_offset;
+            // When transpose=true, we process one output column at a time
+            for (uint32_t col_loop = 0; col_loop < num_col_loops; ++col_loop) {
+                tile_regs_acquire();
+                uint32_t dst_index = 0;
+                uint32_t in0_index = in0_index_offset;
+                // For transpose: offset by col_loop * K to get to correct N row
+                uint32_t in1_index = in1_index_offset + (transpose ? col_loop * in1_col_stride : 0);
 
-            for (uint32_t inner_dim = 0; inner_dim < in0_block_w; inner_dim++) {
-                matmul_block(
-                    in0_cb, in1_cb, in0_index, in1_index, dst_index, transpose, subblock_w, subblock_h, in0_block_w);
-                in0_index++;
-                in1_index += N;
-            }
-            if (add_mask) {
-                cb_wait_front(mask_cb, out_subblock_num_tiles);
-                cb_wait_front(zero_cb, 1);
-                add_tiles_init(zero_cb, mask_cb, true);
-                for (uint32_t i = 0; i < out_subblock_num_tiles; i++) {
-                    add_tiles(zero_cb, mask_cb, 0, i, i);
+                for (uint32_t inner_dim = 0; inner_dim < in0_block_w; inner_dim++) {
+                    matmul_block(
+                        in0_cb,
+                        in1_cb,
+                        in0_index,
+                        in1_index,
+                        dst_index,
+                        transpose,
+                        effective_subblock_w,
+                        subblock_h,
+                        in0_block_w);
+                    in0_index++;
+                    in1_index += in1_inner_stride;
                 }
+                uint32_t col_out_tiles = subblock_h * effective_subblock_w;
+                if (add_mask) {
+                    cb_wait_front(mask_cb, col_out_tiles);
+                    cb_wait_front(zero_cb, 1);
+                    add_tiles_init(zero_cb, mask_cb, true);
+                    for (uint32_t i = 0; i < col_out_tiles; i++) {
+                        add_tiles(zero_cb, mask_cb, 0, i, i);
+                    }
+                }
+                tile_regs_commit();
+                tile_regs_wait();
+                cb_reserve_back(out_cb, col_out_tiles);
+                for (uint32_t i = 0; i < col_out_tiles; i++) {
+                    pack_tile(i, out_cb);
+                }
+                cb_push_back(out_cb, col_out_tiles);
+                tile_regs_release();
             }
-            tile_regs_commit();
-            tile_regs_wait();
-            cb_reserve_back(out_cb, out_subblock_num_tiles);
-            for (uint32_t i = 0; i < out_subblock_num_tiles; i++) {
-                pack_tile(i, out_cb);
-            }
-            cb_push_back(out_cb, out_subblock_num_tiles);
-            tile_regs_release();
-            in1_index_offset += subblock_w;
+            in1_index_offset += in1_subblock_stride;
         }
         in0_index_offset += subblock_h * in0_block_w;
     }
