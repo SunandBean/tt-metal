@@ -36,41 +36,48 @@ void read_kv_chunks(
     uint32_t barrier_count = 0;
     for (uint32_t k_chunk = k_chunk_start; k_chunk < k_chunk_end; ++k_chunk) {
         // Read K chunk transposed
-        cb_reserve_back(cb_k_in, k_chunk_tiles);
-        uint32_t k_write_ptr = get_write_ptr(cb_k_in);
-        uint64_t k_base_read_ptr = get_noc_addr(k_write_ptr);
-        barrier_count = 0;
-        for (uint32_t col = 0; col < DHt; ++col) {
-            uint32_t k_tile_id = k_start_tile_id + col;
-            for (uint32_t row = 0; row < Sk_chunk_t; ++row) {
-                noc_async_read_tile(k_tile_id, k_reader, k_write_ptr);
-                if (++barrier_count == barrier_threshold) {
-                    noc_async_read_barrier();
-                    barrier_count = 0;
+        uint64_t k_base_read_ptr;
+        {
+            DeviceZoneScopedN("reader-k-read");
+            cb_reserve_back(cb_k_in, k_chunk_tiles);
+            uint32_t k_write_ptr = get_write_ptr(cb_k_in);
+            k_base_read_ptr = get_noc_addr(k_write_ptr);
+            barrier_count = 0;
+            for (uint32_t col = 0; col < DHt; ++col) {
+                uint32_t k_tile_id = k_start_tile_id + col;
+                for (uint32_t row = 0; row < Sk_chunk_t; ++row) {
+                    noc_async_read_tile(k_tile_id, k_reader, k_write_ptr);
+                    if (++barrier_count == barrier_threshold) {
+                        noc_async_read_barrier();
+                        barrier_count = 0;
+                    }
+                    k_tile_id += DHt;
+                    k_write_ptr += k_tile_bytes;
                 }
-                k_tile_id += DHt;
-                k_write_ptr += k_tile_bytes;
             }
+            noc_async_read_barrier();
+            cb_push_back(cb_k_in, k_chunk_tiles);
         }
-        noc_async_read_barrier();
-        cb_push_back(cb_k_in, k_chunk_tiles);
 
         // Read V chunk (transpose of K), from K's L1 buffer (MLA always reuses K for V)
-        cb_reserve_back(cb_v_in, v_chunk_tiles);
-        uint32_t v_write_ptr = get_write_ptr(cb_v_in);
-        uint64_t k_read_ptr = k_base_read_ptr;
-        for (uint32_t row = 0; row < Sk_chunk_t; ++row) {       // Row of V
-            k_read_ptr = k_base_read_ptr + row * k_tile_bytes;  // Increment across K's Col
+        {
+            DeviceZoneScopedN("reader-v-read");
+            cb_reserve_back(cb_v_in, v_chunk_tiles);
+            uint32_t v_write_ptr = get_write_ptr(cb_v_in);
+            uint64_t k_read_ptr = k_base_read_ptr;
+            for (uint32_t row = 0; row < Sk_chunk_t; ++row) {       // Row of V
+                k_read_ptr = k_base_read_ptr + row * k_tile_bytes;  // Increment across K's Col
 
-            for (uint32_t col = 0; col < vDHt; ++col) {  // Col of V
-                noc_async_read(k_read_ptr, v_write_ptr, v_tile_bytes);
+                for (uint32_t col = 0; col < vDHt; ++col) {  // Col of V
+                    noc_async_read(k_read_ptr, v_write_ptr, v_tile_bytes);
 
-                v_write_ptr += v_tile_bytes;
-                k_read_ptr += Sk_chunk_t * k_tile_bytes;  // Stride across K's width
+                    v_write_ptr += v_tile_bytes;
+                    k_read_ptr += Sk_chunk_t * k_tile_bytes;  // Stride across K's width
+                }
             }
+            noc_async_read_barrier();
+            cb_push_back(cb_v_in, v_chunk_tiles);
         }
-        noc_async_read_barrier();
-        cb_push_back(cb_v_in, v_chunk_tiles);
 
         // Update the starting tile id for next iteration
         k_start_tile_id += k_chunk_tiles;
@@ -188,29 +195,32 @@ void kernel_main() {
     constexpr uint32_t barrier_threshold = get_barrier_read_threshold<q_tile_bytes, num_cores>();
 
     // Read Q from sharded memory (Q is always sharded)
-    uint64_t q_read_addr;
-    uint32_t q_write_ptr;
-    if (is_output_core) {
-        q_read_addr = get_noc_addr(q_addr);
-    } else {
-        q_read_addr = get_noc_addr(output_core_noc_x, output_core_noc_y, q_addr);
-    }
-    if constexpr (tilize_q) {
-        cb_reserve_back(cb_q_rm, q_chunk_tiles);
-        q_write_ptr = get_write_ptr(cb_q_rm);
-    } else {
-        cb_reserve_back(cb_q_in, q_chunk_tiles);
-        q_write_ptr = get_write_ptr(cb_q_in);
-    }
-    // Q tensor is properly set up with tiny tiles, just read contiguously
-    noc_async_read(q_read_addr, q_write_ptr, q_chunk_size_bytes);
-    noc_async_read_barrier();
-    // DPRINT << TileSlice(cb_q_in, 0, SliceRange{.h0 = 0, .h1 = 8, .hs = 1, .w0 = 0, .w1 = 32, .ws = 8}, true, true) <<
-    // ENDL();
-    if constexpr (tilize_q) {
-        cb_push_back(cb_q_rm, q_chunk_tiles);
-    } else {
-        cb_push_back(cb_q_in, q_chunk_tiles);
+    {
+        DeviceZoneScopedN("reader-q-read");
+        uint64_t q_read_addr;
+        uint32_t q_write_ptr;
+        if (is_output_core) {
+            q_read_addr = get_noc_addr(q_addr);
+        } else {
+            q_read_addr = get_noc_addr(output_core_noc_x, output_core_noc_y, q_addr);
+        }
+        if constexpr (tilize_q) {
+            cb_reserve_back(cb_q_rm, q_chunk_tiles);
+            q_write_ptr = get_write_ptr(cb_q_rm);
+        } else {
+            cb_reserve_back(cb_q_in, q_chunk_tiles);
+            q_write_ptr = get_write_ptr(cb_q_in);
+        }
+        // Q tensor is properly set up with tiny tiles, just read contiguously
+        noc_async_read(q_read_addr, q_write_ptr, q_chunk_size_bytes);
+        noc_async_read_barrier();
+        // DPRINT << TileSlice(cb_q_in, 0, SliceRange{.h0 = 0, .h1 = 8, .hs = 1, .w0 = 0, .w1 = 32, .ws = 8}, true,
+        // true) << ENDL();
+        if constexpr (tilize_q) {
+            cb_push_back(cb_q_rm, q_chunk_tiles);
+        } else {
+            cb_push_back(cb_q_in, q_chunk_tiles);
+        }
     }
 
     // Create KV cache reader (DRAM interleaved)
@@ -219,7 +229,6 @@ void kernel_main() {
     for (uint32_t cur_head = cur_head_group * num_heads_per_core;
          cur_head < cur_head_group * num_heads_per_core + num_heads_per_core;
          ++cur_head) {
-        DeviceZoneScopedN("reader-kv-loop");
         // Offset for current batch (non-paged attention)
         const uint32_t k_batch_offset = ((cur_batch / q_heads_parallel_factor) % Bkv) * num_kv_heads * St * DHt;
         const uint32_t k_head_offset = cur_head * St * DHt;

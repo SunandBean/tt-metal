@@ -15,6 +15,7 @@
 #include "compute_kernel_api/tile_move_copy.h"
 #include "compute_kernel_api/matmul.h"
 #include "compute_kernel_api/reduce.h"
+#include "tools/profiler/kernel_profiler.hpp"
 
 /******************************************************************************
  *                                                                             *
@@ -593,7 +594,10 @@ ALWI void cb_matmul_blocks(
         in0_cb, in1_cb, transpose /*transpose*/, subblock_w /*ct_dim*/, subblock_h /*rt_dim*/, in0_block_w /*kt_dim*/);
 
     reconfig_data_format(in1_cb, in0_cb);
-    cb_wait_front(in1_cb, K * N);
+    {
+        DeviceZoneScopedN("matmul-wait-in1");
+        cb_wait_front(in1_cb, K * N);
+    }
 
     uint32_t output_num_tiles = M * N;
     cb_reserve_back(out_cb, output_num_tiles);
