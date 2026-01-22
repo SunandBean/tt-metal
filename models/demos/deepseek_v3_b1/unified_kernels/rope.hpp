@@ -95,23 +95,28 @@ struct Rope {
     private:
         void impl(const RTArgs& args) {
 #if defined(COMPILE_FOR_NCRISC)
+
             constexpr uint32_t Ht = 1;
             constexpr uint32_t Wt = CTArgs::Wt;
-
+            DPRINT << "rope ncrisc op Wt: " << Wt << ENDL();
             for (uint32_t ht = 0; ht < Ht; ht++) {
-                cb_reserve_back(args.in_cb, Wt);
-                cb_push_back(args.in_cb, Wt);
+                // cb_reserve_back(args.in_cb, Wt);
+                // cb_push_back(args.in_cb, Wt);
             }
 
-            cb_reserve_back(args.trans_mat_cb, 1);
-            cb_push_back(args.trans_mat_cb, 1);
+            DPRINT << "rope ncrisc op reserve back trans_mat" << args.trans_mat_cb << ENDL();
+            // cb_reserve_back(args.trans_mat_cb, 1);
+            DPRINT << "rope ncrisc op push back" << ENDL();
+            //  cb_push_back(args.trans_mat_cb, 1);
 
-            cb_reserve_back(args.sin_cb, Wt);
-            cb_push_back(args.sin_cb, Wt);
+            //  cb_reserve_back(args.sin_cb, Wt);
+            //  cb_push_back(args.sin_cb, Wt);
 
-            cb_reserve_back(args.cos_cb, Wt);
-            cb_push_back(args.cos_cb, Wt);
+            //   cb_reserve_back(args.cos_cb, Wt);
+            //  cb_push_back(args.cos_cb, Wt);
+            DPRINT << "rope ncrisc op done" << ENDL();
 #elif defined(COMPILE_FOR_TRISC)
+            DPRINT << "rope trisc op" << ENDL();
             constexpr uint32_t Wt = CTArgs::Wt;
             constexpr uint32_t Ht = 1;
 
@@ -132,12 +137,15 @@ struct Rope {
             // Main loop: process each head tile row
             // ================================================================
             for (uint32_t ht = 0; ht < Ht; ht++) {
+                DPRINT << "rope compute " << ht << ENDL();
                 // Reserve intermediate and output buffers
                 cb_reserve_back(args.rotated_in_interm_cb, Wt);
                 cb_reserve_back(args.sin_interm_cb, Wt);
+                DPRINT << " cos interm cb reserve back " << Wt << ENDL();
                 cb_reserve_back(args.cos_interm_cb, Wt);
                 cb_reserve_back(args.out_cb, Wt);
 
+                DPRINT << "rope trisc op HUNG " << args.in_cb << ENDL();
                 // Signal input row is ready (sharded tensor)
                 cb_wait_front(args.in_cb, Wt);
 
@@ -188,14 +196,19 @@ struct Rope {
                     pack_tile(j, args.cos_interm_cb, j);
                 }
                 tile_regs_release();
+                DPRINT << " cos interm cb push back " << Wt << ENDL();
                 cb_push_back(args.cos_interm_cb, Wt);
+                DPRINT << " done push back " << ENDL();
                 cb_pop_front(args.in_cb, Wt);
 
                 // ============================================================
                 // Step 4: output = cos_interm + sin_interm (add)
                 // ============================================================
                 cb_wait_front(args.sin_interm_cb, Wt);
+
+                DPRINT << " cos interm cb wait front " << Wt << ENDL();
                 cb_wait_front(args.cos_interm_cb, Wt);
+                DPRINT << " done wait front " << ENDL();
                 add_tiles_init(args.cos_interm_cb, args.sin_interm_cb);
                 tile_regs_acquire();
                 for (uint32_t j = 0; j < Wt; ++j) {
@@ -206,12 +219,15 @@ struct Rope {
                 for (uint32_t j = 0; j < Wt; ++j) {
                     pack_tile(j, args.out_cb, j);
                 }
+                DPRINT << "done on core " << ENDL();
                 tile_regs_release();
                 cb_push_back(args.out_cb, Wt);
                 cb_pop_front(args.sin_interm_cb, Wt);
+                DPRINT << " cos interm cb pop front " << Wt << ENDL();
                 cb_pop_front(args.cos_interm_cb, Wt);
             }
 
+            DPRINT << "done on core " << ENDL();
             // ================================================================
             // Cleanup: pop sin/cos (trans_mat is reused, not popped)
             // ================================================================

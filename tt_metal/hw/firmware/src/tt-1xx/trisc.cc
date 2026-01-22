@@ -177,4 +177,5 @@ int main(int argc, char* argv[]) {
         tensix_sync();
         *trisc_run = RUN_SYNC_MSG_DONE;
     }
+    DPRINT << "TRISC done" << ENDL();
 }

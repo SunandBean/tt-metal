@@ -143,6 +143,10 @@ def test_rope_decode(device, batch, num_heads, head_dim, position_id, pcc):
         tile=trans_tile,
     )
 
+    print(x_ttnn.shape)
+    print(cos_selected.shape)
+    print(sin_selected.shape)
+    print(trans_mat.shape)
     # Create output tensor with same sharded memory config and tiny tile as input
     torch_output_zeros = torch.zeros_like(x_ttnn, dtype=torch.bfloat16)
     tt_out = ttnn.from_torch(

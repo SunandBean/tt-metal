@@ -176,7 +176,7 @@ def test_kv_cache_branch(device, epsilon, use_fp32):
         ttnn.ShardOrientation.ROW_MAJOR,
     )
     cos_sin_mem_config = ttnn.MemoryConfig(
-        ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, cos_sin_shard_spec
+        ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.L1, cos_sin_shard_spec
     )
 
     tt_cos = ttnn.from_torch(
@@ -216,10 +216,13 @@ def test_kv_cache_branch(device, epsilon, use_fp32):
         memory_config=trans_mem_config,
         tile=trans_tile,
     )
+    print(tt_cos.shape)
+    print(tt_sin.shape)
+    print(tt_trans.shape)
 
     # Create output tensor
     output_shape = (1, 512)
-    output_shard_shape = (1, 512)  # (1, 128)
+    output_shard_shape = (1, 512)
     output_shard_spec = ttnn.ShardSpec(
         rms_crs,
         output_shard_shape,
@@ -246,7 +249,7 @@ def test_kv_cache_branch(device, epsilon, use_fp32):
         ttnn_gamma,
         tt_cos,
         tt_sin,
-        position_ids_expanded,
+        tt_trans,
         ttnn_output,
     )
 

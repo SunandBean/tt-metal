@@ -66,6 +66,20 @@ KERNEL_ENTRY {
         get_arg_val<uint32_t>(0),  // scalar (1/sqrt(512)) #TODO: fix id when used in pre sdpa
     };
 
+    using K_RopeCTArgs = deepseek_b1_ops::Rope::ReaderCTArgs<get_named_compile_time_arg_val("Wt")>;
+    constexpr uint32_t k_rope_input_cb = get_named_compile_time_arg_val("in_cb");
+    constexpr uint32_t cos_cb = get_named_compile_time_arg_val("cos_cb");
+    constexpr uint32_t sin_cb = get_named_compile_time_arg_val("sin_cb");
+    constexpr uint32_t trans_mat_cb = get_named_compile_time_arg_val("trans_mat_cb");
+
+    // Reader args: CB indices for sharded input signaling
+    deepseek_b1_ops::Rope::ReaderArgs k_rope_args{
+        .in_cb = k_rope_input_cb,
+        .cos_cb = cos_cb,
+        .sin_cb = sin_cb,
+        .trans_mat_cb = trans_mat_cb,
+    };
+
 // ============================================================================
 // BRISC (Writer) - WriterConfigDescriptor compiles as BRISC
 // Named compile-time args: TODO
@@ -88,6 +102,11 @@ KERNEL_ENTRY {
     };
 
     deepseek_b1_ops::RMSNorm::WriterArgs kv_rmsnorm_args{};
+
+    using K_RopeCTArgs = deepseek_b1_ops::Rope::WriterCTArgs;
+
+    // Writer args (empty - no-op)
+    deepseek_b1_ops::Rope::WriterArgs k_rope_args{};
 
 // ============================================================================
 // TRISC (Compute) - ComputeConfigDescriptor compiles as TRISC
@@ -123,6 +142,29 @@ KERNEL_ENTRY {
         get_named_compile_time_arg_val("kv_rmsnorm_output_cb"),
         get_arg_val<uint32_t>(0),  // epsilon
     };
+    using K_RopeCTArgs = deepseek_b1_ops::Rope::ComputeCTArgs<get_named_compile_time_arg_val("Wt")>;
+
+    // CB indices (passed as runtime args to ComputeArgs)
+    constexpr uint32_t k_rope_input_cb = get_named_compile_time_arg_val("in_cb");
+    constexpr uint32_t cos_cb = get_named_compile_time_arg_val("cos_cb");
+    constexpr uint32_t sin_cb = get_named_compile_time_arg_val("sin_cb");
+    constexpr uint32_t trans_mat_cb = get_named_compile_time_arg_val("trans_mat_cb");
+    constexpr uint32_t rotated_in_interm_cb = get_named_compile_time_arg_val("rotated_in_interm_cb");
+    constexpr uint32_t cos_interm_cb = get_named_compile_time_arg_val("cos_interm_cb");
+    constexpr uint32_t sin_interm_cb = get_named_compile_time_arg_val("sin_interm_cb");
+    constexpr uint32_t k_rope_output_cb = get_named_compile_time_arg_val("out_cb");
+
+    // Compute args: all CB indices
+    deepseek_b1_ops::Rope::ComputeArgs k_rope_args{
+        .in_cb = k_rope_input_cb,
+        .cos_cb = cos_cb,
+        .sin_cb = sin_cb,
+        .trans_mat_cb = trans_mat_cb,
+        .rotated_in_interm_cb = rotated_in_interm_cb,
+        .cos_interm_cb = cos_interm_cb,
+        .sin_interm_cb = sin_interm_cb,
+        .out_cb = k_rope_output_cb,
+    };
 #endif
 #if defined(COMPILE_FOR_NCRISC)
     // Setup sharded persistent buffers
@@ -142,6 +184,14 @@ KERNEL_ENTRY {
         constexpr uint32_t kv_rmsnorm_gamma_cb = get_named_compile_time_arg_val("kv_rmsnorm_gamma_cb");
         constexpr uint32_t kv_rmsnorm_num_tiles = get_named_compile_time_arg_val("kv_rmsnorm_num_tiles");
         unified_kernels::setup_sharded_buffer(kv_rmsnorm_gamma_cb, kv_rmsnorm_num_tiles);
+    }
+    if constexpr (Core::is_krope_core) {
+        constexpr uint32_t cos_cb = get_named_compile_time_arg_val("cos_cb");
+        constexpr uint32_t sin_cb = get_named_compile_time_arg_val("sin_cb");
+        constexpr uint32_t trans_mat_cb = get_named_compile_time_arg_val("trans_mat_cb");
+        unified_kernels::setup_sharded_buffer(cos_cb, 1);
+        unified_kernels::setup_sharded_buffer(sin_cb, 1);
+        unified_kernels::setup_sharded_buffer(trans_mat_cb, 1);
     }
 #endif
 
@@ -171,8 +221,18 @@ KERNEL_ENTRY {
     DPRINT << "KV_RMSNORM" << ENDL();
     {
         DeviceZoneScopedN("KV_RMSNORM");
-        deepseek_b1_ops::RMSNorm::Op<KV_RMSNormCTArgs, Core::is_dkv_matmul_core, true> kv_rmsnorm;
+        deepseek_b1_ops::RMSNorm::Op<KV_RMSNormCTArgs, Core::is_kv_rmsnorm_core, true> kv_rmsnorm;
         kv_rmsnorm(kv_rmsnorm_args);
+    }
+
+    DPRINT << "K_ROPE" << ENDL();
+    // ========================================================================
+    // Rope: Apply Rope to the gathered data
+    // ========================================================================
+    {
+        DeviceZoneScopedN("K_ROPE");
+        deepseek_b1_ops::Rope::Op<K_RopeCTArgs, Core::is_krope_core> k_rope;
+        k_rope(k_rope_args);
     }
     DPRINT << "KERNEL done" << ENDL();
 }

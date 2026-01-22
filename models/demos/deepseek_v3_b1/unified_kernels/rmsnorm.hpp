@@ -96,6 +96,7 @@ struct RMSNorm {
     public:
         void operator()(const RTArgs& args) {
             if constexpr (IsActiveCore) {
+                DPRINT << "rmsnorm op" << ENDL();
                 impl(args);
             }
         }
