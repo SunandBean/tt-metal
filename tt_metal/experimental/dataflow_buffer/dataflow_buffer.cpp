@@ -192,6 +192,11 @@ uint32_t ProgramImpl::add_dataflow_buffer(const CoreRangeSet& core_range_set, co
     TT_FATAL(config.pap != ::experimental::AccessPattern::BLOCKED, "Blocked producer pattern not supported");
     TT_FATAL(config.cap != ::experimental::AccessPattern::BLOCKED, "Blocked consumer pattern not supported yet");
     TT_FATAL(!config.enable_implicit_sync, "Implicit sync not supported yet");
+    TT_FATAL(
+        core_range_set.num_cores() == 1,
+        "DFB only supports single core, but CoreRangeSet contains {} cores: {}",
+        core_range_set.num_cores(),
+        core_range_set.str());
 
     auto dfb = std::make_shared<DataflowBufferImpl>();
 
