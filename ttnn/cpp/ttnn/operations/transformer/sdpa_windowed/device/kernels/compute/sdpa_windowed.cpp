@@ -5,8 +5,7 @@
 #include "compute_kernel_api.h"
 #include "ttnn/cpp/ttnn/operations/transformer/sdpa/device/kernels/compute/compute_common.hpp"
 
-namespace NAMESPACE {
-void MAIN {
+void kernel_main() {
     constexpr uint32_t Skt = get_compile_time_arg_val(0);
     constexpr uint32_t DHt = get_compile_time_arg_val(1);
     constexpr uint32_t Sq_chunk_t = get_compile_time_arg_val(2);
@@ -217,4 +216,3 @@ void MAIN {
         }
     }
 }
-}  // namespace NAMESPACE

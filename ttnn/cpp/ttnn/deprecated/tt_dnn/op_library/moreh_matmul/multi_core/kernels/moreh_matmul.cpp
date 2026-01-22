@@ -8,8 +8,6 @@
 #include "compute_kernel_api/matmul.h"
 #include "compute_kernel_api/transpose_wh.h"
 
-namespace NAMESPACE {
-
 ////////////////////
 // global variables
 ////////////////////
@@ -338,7 +336,7 @@ FORCE_INLINE void matmul(uint32_t num_output_tiles, uint32_t Kt) {
     }
 }
 
-void MAIN {
+void kernel_main() {
     // compile-time args
     constexpr uint32_t num_output_tiles = get_compile_time_arg_val(0);
     constexpr uint32_t Mt = get_compile_time_arg_val(1);
@@ -391,4 +389,3 @@ void MAIN {
         matmul(num_output_tiles, Kt);
     }
 }
-}  // namespace NAMESPACE

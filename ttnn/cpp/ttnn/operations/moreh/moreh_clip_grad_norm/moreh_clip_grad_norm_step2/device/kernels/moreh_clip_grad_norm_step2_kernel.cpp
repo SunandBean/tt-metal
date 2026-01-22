@@ -4,8 +4,7 @@
 
 #include "ttnn/deprecated/tt_dnn/kernels/compute/moreh_common.hpp"
 
-namespace NAMESPACE {
-void MAIN {
+void kernel_main() {
     int i{0};
     const auto num_tiles = get_arg_val<uint32_t>(i++);
     const auto p = get_arg_val<uint32_t>(i++);
@@ -74,4 +73,3 @@ void MAIN {
     // x^p
     power_tile_to_cb(cb_x, cb_xpow, cb_logx, cb_decimal, cb_exp_lxmd, cb_y, p, p_is_negative);
 }  // void MAIN
-}  // namespace NAMESPACE

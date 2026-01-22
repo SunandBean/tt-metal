@@ -10,8 +10,6 @@
 #include "compute_kernel_api/reconfig_data_format.h"
 #include "compute_kernel_api/pack.h"
 
-namespace NAMESPACE {
-
 FORCE_INLINE void transpose_and_pack(uint32_t input_cb_index, uint32_t dest_cb_index, uint32_t total_tiles) {
     reconfig_data_format_srca(input_cb_index);
     transpose_wh_init_short(input_cb_index);
@@ -58,7 +56,7 @@ FORCE_INLINE void cb_reserve_push_back(uint32_t cb, uint32_t count) {
     cb_push_back(cb, count);
 }
 
-void MAIN {
+void kernel_main() {
     constexpr uint32_t input_val_cb_index = get_compile_time_arg_val(0);
     constexpr uint32_t input_ind_cb_index = get_compile_time_arg_val(1);
     constexpr uint32_t transposed_val_cb_index = get_compile_time_arg_val(2);
@@ -238,5 +236,3 @@ void MAIN {
         transpose_and_pack(result_prep_ind_cb_index, output_ind_cb_index, output_tiles);
     }
 }
-
-}  // namespace NAMESPACE
