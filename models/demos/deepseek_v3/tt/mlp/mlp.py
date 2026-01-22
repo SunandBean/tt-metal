@@ -429,50 +429,82 @@ class MLP(AbstractModule):
         return x6
 
     @classmethod
-    def forward_prefill(cls, x: ttnn.Tensor, cfg: RunPrefillConfig) -> ttnn.Tensor:
-        num_layers, _, seq_len, _ = x.shape
+    def _fwd_all_gather_prefill(cls, x: ttnn.Tensor, cfg: RunPrefillConfig, ccl: CCL) -> ttnn.Tensor:
+        return ttnn.experimental.all_gather_async(x, **ccl.populate_all_gather_runtime_args(cfg["all_gather"]))
 
-        # CCL runtime initialization in execution order
-        ccl = cfg["ccl"]
-
-        # All gather for efficient matmuls
-        x = ttnn.experimental.all_gather_async(x, **ccl.populate_all_gather_runtime_args(cfg["all_gather"]))
-
+    @classmethod
+    def _fwd_ff1_prefill(
+        cls, x: ttnn.Tensor, seq_len: int, cfg: RunPrefillConfig
+    ) -> tuple[ttnn.Tensor, ttnn.Tensor, int]:
         # Chunk the input if needed
         if seq_len > cfg["max_rows"]:  # For large sequence lengths, process the input in chunks
-            x = ttnn.reshape(x, [num_layers, even_int_div(seq_len, cfg["max_rows"]), cfg["max_rows"], -1])
+            x = ttnn.reshape(x, [x.shape[0], even_int_div(seq_len, cfg["max_rows"]), cfg["max_rows"], -1])
             seq_len = cfg["max_rows"]
 
-        # Gate and up projections with dynamic program configs
         w1_out = ttnn.linear(
             x, program_config=cls._get_prefill_pc(seq_len=seq_len, is_w2=False, **cfg["linear_pc_gen"]), **cfg["w1"]
         )
+        return x, w1_out, seq_len
+
+    @classmethod
+    def _fwd_ff3_prefill(cls, x: ttnn.Tensor, seq_len: int, cfg: RunPrefillConfig) -> ttnn.Tensor:
         w3_out = ttnn.linear(
             x, program_config=cls._get_prefill_pc(seq_len=seq_len, is_w2=False, **cfg["linear_pc_gen"]), **cfg["w3"]
         )
         ttnn.deallocate(x)
+        return w3_out
 
-        # Apply silu
-        # w1_out_activated = cls._silu_workaround(w1_out)
-        # ttnn.deallocate(w1_out)
-
-        # Apply activation and multiply
+    @classmethod
+    def _fwd_mul_silu_prefill(cls, w1_out: ttnn.Tensor, w3_out: ttnn.Tensor, cfg: RunPrefillConfig) -> ttnn.Tensor:
         activated = ttnn.mul(w1_out, w3_out, **cfg["mul"])
         ttnn.deallocate(w1_out)
         ttnn.deallocate(w3_out)
+        return activated
 
-        # Down projection with dynamic program configs, no need to reshard as we are using dram activations
+    @classmethod
+    def _fwd_ff2_prefill(cls, activated: ttnn.Tensor, seq_len: int, cfg: RunPrefillConfig) -> ttnn.Tensor:
         output = ttnn.linear(
             activated,
             program_config=cls._get_prefill_pc(seq_len=seq_len, is_w2=True, **cfg["linear_pc_gen"]),
             **cfg["w2"],
         )
         ttnn.deallocate(activated)
+        return output
 
-        # Reduce-scatter across devices to sum partial results
-        output = ttnn.experimental.reduce_scatter_minimal_async(
+    @classmethod
+    def _fwd_reduce_scatter_prefill(cls, output: ttnn.Tensor, cfg: RunPrefillConfig, ccl: CCL) -> ttnn.Tensor:
+        return ttnn.experimental.reduce_scatter_minimal_async(
             output, **ccl.populate_reduce_scatter_runtime_args(cfg["reduce_scatter_async"])
         )
+
+    @classmethod
+    def forward_prefill(cls, x: ttnn.Tensor, cfg: RunPrefillConfig) -> ttnn.Tensor:
+        num_layers, _, seq_len, _ = x.shape
+
+        # CCL runtime initialization in execution order
+        ccl = cfg["ccl"]
+
+        ### All Gather
+        x = cls._fwd_all_gather_prefill(x, cfg, ccl)
+
+        ### FF1
+        x, w1_out, seq_len = cls._fwd_ff1_prefill(x, seq_len, cfg)
+
+        ### FF3
+        w3_out = cls._fwd_ff3_prefill(x, seq_len, cfg)
+
+        # Apply silu
+        # w1_out_activated = cls._silu_workaround(w1_out)
+        # ttnn.deallocate(w1_out)
+
+        ### Multiply + SiLU
+        activated = cls._fwd_mul_silu_prefill(w1_out, w3_out, cfg)
+
+        ### FF2
+        output = cls._fwd_ff2_prefill(activated, seq_len, cfg)
+
+        ### Reduce Scatter
+        output = cls._fwd_reduce_scatter_prefill(output, cfg, ccl)
 
         # De-chunk the output if the input was chunked
         _, num_chunks, _, output_dim = output.shape

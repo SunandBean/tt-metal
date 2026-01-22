@@ -216,15 +216,38 @@ class Experts(AbstractModule):
         num_sparse_blocks = num_tokens // SPARSITY_BLOCK_SIZE
         x = ttnn.reshape(x, shape=(1, num_sparse_blocks, SPARSITY_BLOCK_SIZE, hidden_size))
 
-        # Gate and up projections
-        w1_out = ttnn.sparse_matmul(x, sparsity=sparsity, **cfg["w1_experts"])
-        w3_out = ttnn.sparse_matmul(x, sparsity=sparsity, **cfg["w3_experts"])
+        ### FF1
+        w1_out = cls._fwd_ff1(x, sparsity, cfg)
 
-        # Apply activation and multiply
-        activated = ttnn.mul(w1_out, w3_out, **cfg["mul_experts"])
-        ttnn.deallocate(w1_out)
-        ttnn.deallocate(w3_out)
+        ### FF3
+        w3_out = cls._fwd_ff3(x, sparsity, cfg)
 
+        # Multiply + SiLU
+        activated = cls._fwd_mul_silu(w1_out, w3_out, cfg)
+
+        ### FF2
+        output = cls._fwd_ff2(activated, sparsity, cfg, num_tokens, hidden_size)
+
+        assert output.memory_config() == cfg["output_memory_config"]
+        return output
+
+    @classmethod
+    def _fwd_ff1(cls, x: ttnn.Tensor, sparsity: ttnn.Tensor, cfg: RunDecodeConfig) -> ttnn.Tensor:
+        return ttnn.sparse_matmul(x, sparsity=sparsity, **cfg["w1_experts"])
+
+    @classmethod
+    def _fwd_ff3(cls, x: ttnn.Tensor, sparsity: ttnn.Tensor, cfg: RunDecodeConfig) -> ttnn.Tensor:
+        return ttnn.sparse_matmul(x, sparsity=sparsity, **cfg["w3_experts"])
+
+    @classmethod
+    def _fwd_ff2(
+        cls,
+        activated: ttnn.Tensor,
+        sparsity: ttnn.Tensor,
+        cfg: RunDecodeConfig,
+        num_tokens: int,
+        hidden_size: int,
+    ) -> ttnn.Tensor:
         # Reshape for down projection
         # activated.shape = Shape([1, 4, 1, 8, 32, 2048])
         activated = ttnn.squeeze(activated, 0)
@@ -237,9 +260,14 @@ class Experts(AbstractModule):
         # Reshape for output
         output = ttnn.permute(output, (1, 0, 2, 3))
         output = ttnn.reshape(output, shape=(1, cfg["num_experts_per_device"], num_tokens, hidden_size))
-
-        assert output.memory_config() == cfg["output_memory_config"]
         return output
+
+    @classmethod
+    def _fwd_mul_silu(cls, w1_out: ttnn.Tensor, w3_out: ttnn.Tensor, cfg: RunDecodeConfig) -> ttnn.Tensor:
+        activated = ttnn.mul(w1_out, w3_out, **cfg["mul_experts"])
+        ttnn.deallocate(w1_out)
+        ttnn.deallocate(w3_out)
+        return activated
 
     @classmethod
     def forward_decode(cls, x: ttnn.Tensor, sparsity: ttnn.Tensor, cfg: RunDecodeConfig) -> ttnn.Tensor:

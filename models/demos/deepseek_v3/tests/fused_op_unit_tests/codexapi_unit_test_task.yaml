@@ -1,0 +1,9 @@
+prompt: |
+  Create a new fused op unit test for the function {{item}} (indicating the module file and the function name). First read the code inside the module carefully, the new fused op unit test should re-use the function call within the module code. Read the AGENTS_GUIDE_ADD_TEST.md file for instructions on how to add a new fused op unit test. Follow the instructions in the file to create the new fused op unit test.
+check: |
+  Verify the new fused op unit test for {{item}}. Check carefully if it satisfies all test cases and requirements in the AGENTS_GUIDE_ADD_TEST.md file. Run the newly created fused op unit test and verify that it passes all the test cases and that the status is reflected in the README.md file.
+  Return an empty string if OK, otherwise explain what is missing.
+on_success: "Acknowledge completion for {{item}}."
+on_failure: |
+  Explain why the check failed for {{item}}.
+tear_down: "No cleanup needed."
