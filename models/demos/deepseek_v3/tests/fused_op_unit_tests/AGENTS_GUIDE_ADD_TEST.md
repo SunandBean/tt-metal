@@ -68,6 +68,10 @@ Notes on performance measurements:
     - Both total_kernel_duration and total_op_to_op_latency are printed, asserted and uploaded via benchmark_data.add_measurement
 - Decode uses trace mode for perf measurements, prefill uses non_trace mode for perf measurements
 
+Notes for skipping tests:
+- Make sure to skip the test by using marks=pytest.mark.skip(...) if possible; skipping inside the unit test takes very long due to device init/teardown
+- All skips for long sequence lengths should only be skipped on CI, not on local machines and when testing the new test file and updating the README.md
+
 Notes on using TT hardware:
 - If running tests, set a timeout of 15 minutes.
 - If there's a machine issue, you'll need to reset the machine using "tt-smi -glx_reset"
