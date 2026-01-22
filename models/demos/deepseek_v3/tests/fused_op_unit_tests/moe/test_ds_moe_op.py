@@ -585,8 +585,6 @@ def test_ds_moe_op(
     else:
         assert mode == "prefill", "Unsupported mode"
         _maybe_skip_long_seq(seq_len)
-        if use_real_weights and seq_len == 8192:
-            pytest.skip("Known low PCC for prefill seq_len=8192 with real weights.")
 
     if not program_cache_enabled:
         mesh_device.disable_and_clear_program_cache()
