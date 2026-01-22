@@ -431,6 +431,11 @@ MetalContext& MetalContext::instance() {
 }
 
 void MetalContext::reinitialize_for_real_hardware() {
+    std::lock_guard<std::mutex> lock(reinitialization_mutex_);
+
+    // Check if device_manager_ is initialized (MetalContext must be fully constructed)
+    TT_FATAL(device_manager_ != nullptr, "Cannot reinitialize MetalContext before it is fully initialized");
+
     // Check if any devices are actually active (not just if MetalContext was initialized)
     // Note: initialized_ flag doesn't get reset until process exit, so we check active devices instead
     auto active_devices = device_manager_->get_all_active_devices();
@@ -445,6 +450,29 @@ void MetalContext::reinitialize_for_real_hardware() {
     rtoptions_.clear_mock_cluster_desc();
     teardown_base_objects();
     initialize_base_objects();
+
+    // Clear and reinitialize device-specific maps for the new cluster configuration
+    dram_bank_offset_map_.clear();
+    l1_bank_offset_map_.clear();
+    dram_bank_to_noc_xy_.clear();
+    l1_bank_to_noc_xy_.clear();
+    worker_logical_col_to_virtual_col_.clear();
+    worker_logical_row_to_virtual_row_.clear();
+
+    dram_bank_offset_map_.reserve(cluster_->all_chip_ids().size());
+    l1_bank_offset_map_.reserve(cluster_->all_chip_ids().size());
+    dram_bank_to_noc_xy_.reserve(cluster_->all_chip_ids().size());
+    l1_bank_to_noc_xy_.reserve(cluster_->all_chip_ids().size());
+    worker_logical_col_to_virtual_col_.reserve(cluster_->all_chip_ids().size());
+    worker_logical_row_to_virtual_row_.reserve(cluster_->all_chip_ids().size());
+    for (ChipId device_id : cluster_->all_chip_ids()) {
+        dram_bank_offset_map_.emplace(device_id, std::vector<int32_t>{});
+        l1_bank_offset_map_.emplace(device_id, std::vector<int32_t>{});
+        dram_bank_to_noc_xy_.emplace(device_id, std::vector<uint16_t>{});
+        l1_bank_to_noc_xy_.emplace(device_id, std::vector<uint16_t>{});
+        worker_logical_col_to_virtual_col_.emplace(device_id, std::vector<uint8_t>{});
+        worker_logical_row_to_virtual_row_.emplace(device_id, std::vector<uint8_t>{});
+    }
 
     log_info(tt::LogMetal, "MetalContext reinitialized with real hardware");
 }
