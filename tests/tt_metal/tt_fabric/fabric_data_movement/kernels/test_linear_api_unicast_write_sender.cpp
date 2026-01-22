@@ -17,7 +17,6 @@ using namespace tt::tt_fabric::mesh::experimental;
 #include "test_linear_common.hpp"
 #include "tests/tt_metal/tt_metal/perf_microbenchmark/routing/kernels/tt_fabric_traffic_gen.hpp"
 #include "tt_metal/fabric/hw/inc/edm_fabric/routing_plane_connection_manager.hpp"
-#include "api/debug/dprint.h"
 
 constexpr uint32_t test_results_addr_arg = get_compile_time_arg_val(0);
 constexpr uint32_t test_results_size_bytes = get_compile_time_arg_val(1);

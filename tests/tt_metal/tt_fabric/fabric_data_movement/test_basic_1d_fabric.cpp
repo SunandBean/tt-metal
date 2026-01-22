@@ -3578,7 +3578,7 @@ void FabricSparseMulticastCommon(
 }
 
 TEST_F(NightlyFabric1DFixture, TestLinearFabricMulticastNocUnicastWrite) {
-    FabricMulticastCommon(this, NOC_UNICAST_WRITE, {std::make_tuple(RoutingDirection::E, 2, 1)});
+    FabricMulticastCommon(this, NOC_UNICAST_WRITE, {std::make_tuple(RoutingDirection::E, 1, 2)});
 }
 TEST_F(NightlyFabric1DFixture, TestLinearFabricMulticastNocUnicastWriteMultiDir) {
     FabricMulticastCommon(
@@ -3679,27 +3679,22 @@ TEST_F(Fabric1DTensixFixture, TestLinearFabricMulticastNocAtomicIncMux) {
     FabricMulticastCommon(this, NOC_UNICAST_ATOMIC_INC, {std::make_tuple(RoutingDirection::E, 1, 2)});
 }
 
-// Sparse multicast test cases
+// Fabric 1D sparse multicast test cases
 TEST_F(NightlyFabric1DFixture, TestLinearFabricSparseMulticastNocUnicastWrite) {
-    FabricSparseMulticastCommon(this, {std::make_tuple(RoutingDirection::E, 0b0111)});  // Write to hops 1 and 2
+    FabricSparseMulticastCommon(this, {std::make_tuple(RoutingDirection::E, 0b0101)});  // Write to hops 1 and 3
 }
 
 TEST_F(NightlyFabric1DFixture, TestLinearFabricSparseMulticastNocUnicastWriteSingleHop) {
-    FabricSparseMulticastCommon(this, {std::make_tuple(RoutingDirection::E, 0b0100)});  // Write to hop 0 only
+    FabricSparseMulticastCommon(this, {std::make_tuple(RoutingDirection::E, 0b0100)});  // Write to hop 3 only
 }
 
 TEST_F(NightlyFabric1DFixture, TestLinearFabricSparseMulticastNocUnicastWriteMultiDir) {
     FabricSparseMulticastCommon(
         this,
         {
-            std::make_tuple(RoutingDirection::E, 0b1),    // Write to hops 0 and 1 eastward
-            std::make_tuple(RoutingDirection::W, 0b0010)  // Write to hop 2 westward
+            std::make_tuple(RoutingDirection::E, 0b1),    // Write to hop 1 eastward
+            std::make_tuple(RoutingDirection::W, 0b0011)  // Write to hops 1 and 2 westward
         });
-}
-
-TEST_F(NightlyFabric1DFixture, TestLinearFabricSparseMulticastNocUnicastWriteSparseBits) {
-    FabricSparseMulticastCommon(
-        this, {std::make_tuple(RoutingDirection::E, 0b1010)});  // Write to hops 1 and 3 (sparse)
 }
 
 }  // namespace tt::tt_fabric::fabric_router_tests

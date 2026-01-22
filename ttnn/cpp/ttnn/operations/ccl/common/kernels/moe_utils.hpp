@@ -43,7 +43,6 @@ struct PolarState {
 PolarState polar_state;
 }
 
-
 template <size_t Size>
 inline void open_direction_connections(
     const std::array<bool, Size>& directions,
