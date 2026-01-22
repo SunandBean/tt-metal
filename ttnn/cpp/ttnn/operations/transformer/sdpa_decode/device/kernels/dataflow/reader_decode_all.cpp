@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include "api/dataflow/dataflow_api.h"
 #include <vector>
+#include "tools/profiler/kernel_profiler.hpp"
 
 #include "ttnn/operations/transformer/sdpa_decode/device/kernels/rt_args_common.hpp"
 #include "dataflow_common.hpp"
@@ -72,6 +73,39 @@ void kernel_main() {
     const uint32_t core_num_in_output = get_arg_val<uint32_t>(arg_idx++);
     const uint32_t cur_pos_arg = get_arg_val<uint32_t>(arg_idx++);
 
+    // DPRINT << "B: " << B << ENDL();
+    // DPRINT << "PNHt: " << PNHt << ENDL();
+    // DPRINT << "St: " << St << ENDL();
+    // DPRINT << "DHt: " << DHt << ENDL();
+    // DPRINT << "vDHt: " << vDHt << ENDL();
+    // DPRINT << "Sk_chunk_t: " << Sk_chunk_t << ENDL();
+    // DPRINT << "num_cores: " << num_cores << ENDL();
+    // DPRINT << "is_q_sharded: " << static_cast<uint32_t>(is_q_sharded) << ENDL();
+    // DPRINT << "num_cores_per_batch: " << num_cores_per_batch << ENDL();
+    // DPRINT << "k_chunk_size: " << k_chunk_size << ENDL();
+    // DPRINT << "index_stick_size_B: " << index_stick_size_B << ENDL();
+    // DPRINT << "is_paged_attention: " << static_cast<uint32_t>(is_paged_attention) << ENDL();
+    // DPRINT << "num_kv_heads: " << num_kv_heads << ENDL();
+    // DPRINT << "block_size_t: " << block_size_t << ENDL();
+    // DPRINT << "Bkv: " << Bkv << ENDL();
+    // DPRINT << "q_heads_parallel_factor: " << q_heads_parallel_factor << ENDL();
+    // DPRINT << "num_cores_per_head: " << num_cores_per_head << ENDL();
+    // DPRINT << "num_heads_per_core: " << num_heads_per_core << ENDL();
+    // DPRINT << "num_output_cores: " << num_output_cores << ENDL();
+    // DPRINT << "is_causal: " << static_cast<uint32_t>(is_causal) << ENDL();
+    // DPRINT << "use_attention_mask: " << static_cast<uint32_t>(use_attention_mask) << ENDL();
+    // DPRINT << "use_attention_sink: " << static_cast<uint32_t>(use_attention_sink) << ENDL();
+    // DPRINT << "max_dynamic_chunk_size: " << max_dynamic_chunk_size << ENDL();
+    // DPRINT << "tilize_q: " << static_cast<uint32_t>(tilize_q) << ENDL();
+    // DPRINT << "reuse_k: " << static_cast<uint32_t>(reuse_k) << ENDL();
+    // DPRINT << "use_half_tile: " << static_cast<uint32_t>(use_half_tile) << ENDL();
+    // DPRINT << "q_chunk_size_bytes: " << q_chunk_size_bytes << ENDL();
+    // DPRINT << "is_cur_pos_tensor_sharded: " << static_cast<uint32_t>(is_cur_pos_tensor_sharded) << ENDL();
+    // DPRINT << "is_page_table_sharded: " << static_cast<uint32_t>(is_page_table_sharded) << ENDL();
+    // DPRINT << "q_page_size_bytes: " << q_page_size_bytes << ENDL();
+    // DPRINT << "sliding_window_size: " << sliding_window_size << ENDL();
+    // DPRINT << "is_output_core: " << static_cast<uint32_t>(is_output_core) << ENDL();
+
     // idle core
     if (q_addr == 0) {
         return;
@@ -80,32 +114,37 @@ void kernel_main() {
     constexpr uint32_t cur_pos_base = St * 32 - 1;
     uint32_t cur_pos = cur_pos_base;  // default to non-causal, which we do attention on the entire kv cache. In this
                                       // case we set cur_pos to the last position
-    if constexpr (is_causal) {
-        // using UINT32_MAX as a flag to indicate that cur_pos is not provided as a list
-        if (cur_pos_arg != UINT32_MAX) {
-            cur_pos = cur_pos_arg;
-        } else {
-            constexpr uint32_t cb_index_id = tt::CBIndex::c_8;
-            cb_reserve_back(cb_index_id, 1);
-            uint32_t index_cb_wr_ptr = get_write_ptr(cb_index_id);
 
-            if constexpr (!is_cur_pos_tensor_sharded) {
-                const auto addrg = TensorAccessor(pos_args, pos_addr, index_stick_size_B);
+    {
+        DeviceZoneScopedN("read cur_pos");
+        if constexpr (is_causal) {
+            // using UINT32_MAX as a flag to indicate that cur_pos is not provided as a list
+            if (cur_pos_arg != UINT32_MAX) {
+                cur_pos = cur_pos_arg;
+            } else {
+                constexpr uint32_t cb_index_id = tt::CBIndex::c_8;
+                cb_reserve_back(cb_index_id, 1);
+                uint32_t index_cb_wr_ptr = get_write_ptr(cb_index_id);
 
-                // index_tensor has one page to read
-                uint64_t tensor_index_noc_addr = addrg.get_noc_addr(0);
-                noc_async_read(tensor_index_noc_addr, index_cb_wr_ptr, index_stick_size_B);
-                noc_async_read_barrier();
+                if constexpr (!is_cur_pos_tensor_sharded) {
+                    const auto addrg = TensorAccessor(pos_args, pos_addr, index_stick_size_B);
+
+                    // index_tensor has one page to read
+                    uint64_t tensor_index_noc_addr = addrg.get_noc_addr(0);
+                    noc_async_read(tensor_index_noc_addr, index_cb_wr_ptr, index_stick_size_B);
+                    noc_async_read_barrier();
+                }
+
+                cb_push_back(cb_index_id, 1);
+                volatile tt_l1_ptr uint32_t* index_ptr =
+                    reinterpret_cast<volatile tt_l1_ptr uint32_t*>(index_cb_wr_ptr);
+                cur_pos = index_ptr[cur_batch / q_heads_parallel_factor];
             }
 
-            cb_push_back(cb_index_id, 1);
-            volatile tt_l1_ptr uint32_t* index_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(index_cb_wr_ptr);
-            cur_pos = index_ptr[cur_batch / q_heads_parallel_factor];
-        }
-
-        if (cur_pos == UINT32_MAX) {
-            // cur_pos of -1 indicates that the user should be skipped
-            return;
+            if (cur_pos == UINT32_MAX) {
+                // cur_pos of -1 indicates that the user should be skipped
+                return;
+            }
         }
     }
 
@@ -125,6 +164,15 @@ void kernel_main() {
         return;  // early exit because no computes needs to be done
     }
 
+    // DPRINT << "PSt: " << PSt << ENDL();
+    // DPRINT << "k_num_chunks: " << k_num_chunks << ENDL();
+    // DPRINT << "k_chunk_start: " << k_chunk_start << ENDL();
+    // DPRINT << "k_chunk_end: " << k_chunk_end << ENDL();
+    // DPRINT << "window_start_unaligned: " << window_start_unaligned << ENDL();
+    // DPRINT << "window_start_chunk: " << window_start_chunk << ENDL();
+    // DPRINT << "Sk_chunk_t_dynamic:" << Sk_chunk_t_dynamic << ENDL();
+    // DPRINT << "tilize_q:" << static_cast<uint32_t>(tilize_q) << ENDL();
+
     tt_l1_ptr uint32_t* all_output_noc_x = (tt_l1_ptr uint32_t*)(get_arg_addr(arg_idx));
     arg_idx += num_output_cores;
     tt_l1_ptr uint32_t* all_output_noc_y = (tt_l1_ptr uint32_t*)(get_arg_addr(arg_idx++));
@@ -132,7 +180,11 @@ void kernel_main() {
     uint32_t output_core_noc_x = all_output_noc_x[cur_batch];
     uint32_t output_core_noc_y = all_output_noc_y[cur_batch];
 
+    // DPRINT << "output_core_noc_x: " << output_core_noc_x << " output_core_noc_y: " << output_core_noc_y << ENDL();
+
     constexpr uint32_t q_chunk_tiles = PNHt * DHt;
+
+    // DPRINT << "q_chunk_tiles: " << q_chunk_tiles << ENDL();
     uint32_t k_chunk_tiles = Sk_chunk_t_dynamic * DHt;
     uint32_t v_chunk_tiles = Sk_chunk_t_dynamic * vDHt;
     uint32_t mask_chunk_tiles = PNHt * Sk_chunk_t_dynamic;
@@ -157,57 +209,63 @@ void kernel_main() {
     // First, read Q entirely, it could be interleaved or sharded
     uint32_t q_batch_offset = cur_batch * q_chunk_tiles;
 
-    if constexpr (is_q_sharded) {
-        uint64_t q_read_addr;
-        uint32_t q_write_ptr;
-        if (is_output_core) {
-            q_read_addr = get_noc_addr(q_addr);
-        } else {
-            q_read_addr = get_noc_addr(output_core_noc_x, output_core_noc_y, q_addr);
-        }
-        if constexpr (tilize_q) {
-            cb_reserve_back(cb_q_rm, q_chunk_tiles);
-            q_write_ptr = get_write_ptr(cb_q_rm);
-        } else {
+    {
+        DeviceZoneScopedN("read Q");
+        if constexpr (is_q_sharded) {
+            uint64_t q_read_addr;
+            uint32_t q_write_ptr;
+            // if (is_output_core) {
+            // q_read_addr = get_noc_addr(q_addr);
+            // } else {
+            //     q_read_addr = get_noc_addr(output_core_noc_x, output_core_noc_y, q_addr);
+            // }
+            //     if constexpr (tilize_q) {
+            //         cb_reserve_back(cb_q_rm, q_chunk_tiles);
+            //         q_write_ptr = get_write_ptr(cb_q_rm);
+            //     } else {
+            //         cb_reserve_back(cb_q_in, q_chunk_tiles);
+            //         q_write_ptr = get_write_ptr(cb_q_in);
+            //     }
+            // if constexpr (use_half_tile and not tilize_q) {
+            //     // q_addr represents 32x32 tiles; read them as 16x32 tiles
+            //     // TODO: Properly setup q input as tiny tiles and remove special handling for tiny tiles
+            //     for (uint8_t tile = 0; tile < q_chunk_tiles; tile++) {
+            //         noc_async_read(q_read_addr, q_write_ptr, q_tile_bytes);
+            //         q_read_addr += 2 * q_tile_bytes;
+            //         q_write_ptr += q_tile_bytes;
+            //     }
+            // } else {
+            //     // Read all Q tiles at once from local L1
+            //     // noc_async_read(q_read_addr, q_write_ptr, q_chunk_size_bytes);
+            // }
+            // // noc_async_read_barrier();
+            // if constexpr (tilize_q) {
+            //     cb_push_back(cb_q_rm, q_chunk_tiles);
+            // } else {
+            //     cb_push_back(cb_q_in, q_chunk_tiles);
+            // }
             cb_reserve_back(cb_q_in, q_chunk_tiles);
-            q_write_ptr = get_write_ptr(cb_q_in);
-        }
-        if constexpr (use_half_tile and not tilize_q) {
-            // q_addr represents 32x32 tiles; read them as 16x32 tiles
-            // TODO: Properly setup q input as tiny tiles and remove special handling for tiny tiles
-            for (uint8_t tile = 0; tile < q_chunk_tiles; tile++) {
+            cb_push_back(cb_q_in, q_chunk_tiles);
+
+        } else {
+            const auto q_reader = TensorAccessor(q_args, q_addr, q_page_size_bytes);
+            uint32_t q_tile_id = q_batch_offset;
+            cb_reserve_back(cb_q_in, q_chunk_tiles);
+            uint32_t q_write_ptr = get_write_ptr(cb_q_in);
+            for (uint32_t tile = 0; tile < q_chunk_tiles; ++tile) {
+                uint64_t q_read_addr = q_reader.get_noc_addr(q_tile_id);
                 noc_async_read(q_read_addr, q_write_ptr, q_tile_bytes);
-                q_read_addr += 2 * q_tile_bytes;
+                q_tile_id += 1;
                 q_write_ptr += q_tile_bytes;
+                if (++barrier_count == barrier_threshold) {
+                    noc_async_read_barrier();
+                    barrier_count = 0;
+                }
             }
-        } else {
-            noc_async_read(q_read_addr, q_write_ptr, q_chunk_size_bytes);
-        }
-        noc_async_read_barrier();
-        if constexpr (tilize_q) {
-            cb_push_back(cb_q_rm, q_chunk_tiles);
-        } else {
+            noc_async_read_barrier();
             cb_push_back(cb_q_in, q_chunk_tiles);
         }
-    } else {
-        const auto q_reader = TensorAccessor(q_args, q_addr, q_page_size_bytes);
-        uint32_t q_tile_id = q_batch_offset;
-        cb_reserve_back(cb_q_in, q_chunk_tiles);
-        uint32_t q_write_ptr = get_write_ptr(cb_q_in);
-        for (uint32_t tile = 0; tile < q_chunk_tiles; ++tile) {
-            uint64_t q_read_addr = q_reader.get_noc_addr(q_tile_id);
-            noc_async_read(q_read_addr, q_write_ptr, q_tile_bytes);
-            q_tile_id += 1;
-            q_write_ptr += q_tile_bytes;
-            if (++barrier_count == barrier_threshold) {
-                noc_async_read_barrier();
-                barrier_count = 0;
-            }
-        }
-        noc_async_read_barrier();
-        cb_push_back(cb_q_in, q_chunk_tiles);
     }
-
     // Read the rest
     const auto k_reader = TensorAccessor(k_args, k_addr, k_tile_bytes);
 
@@ -236,28 +294,32 @@ void kernel_main() {
     // Typed pointers for page table entries in L1
     volatile tt_l1_ptr uint16_t* page_table_ptr_u16 = nullptr;
     volatile tt_l1_ptr uint32_t* page_table_ptr_u32 = nullptr;
-    if constexpr (is_paged_attention) {
-        constexpr uint32_t cb_id_page_table = tt::CBIndex::c_9;
-        uint32_t num_pages_to_read = is_page_table_sharded ? B : 1;
-        cb_reserve_back(cb_id_page_table, num_pages_to_read);
 
-        // Read page table from DRAM
-        if constexpr (!is_page_table_sharded) {
-            page_table_cb_wr_ptr = get_write_ptr(cb_id_page_table);
-            const auto page_table_gen = TensorAccessor(page_table_args, page_table_addr, page_table_page_size);
-            uint64_t page_table_noc_addr = page_table_gen.get_noc_addr((cur_batch / q_heads_parallel_factor));
-            noc_async_read(page_table_noc_addr, page_table_cb_wr_ptr, page_table_page_size);
-            noc_async_read_barrier();
-            page_table_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(page_table_cb_wr_ptr);
-            page_table_ptr_u32 = page_table_ptr;
+    {
+        DeviceZoneScopedN("read page table");
+        if constexpr (is_paged_attention) {
+            constexpr uint32_t cb_id_page_table = tt::CBIndex::c_9;
+            uint32_t num_pages_to_read = is_page_table_sharded ? B : 1;
+            cb_reserve_back(cb_id_page_table, num_pages_to_read);
 
-        } else {  // Read page table from dyanmically allocated L1 buffer
-            page_table_cb_wr_ptr =
-                get_write_ptr(cb_id_page_table) + (cur_batch / q_heads_parallel_factor) * page_table_page_size;
-            page_table_ptr_u16 = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(page_table_cb_wr_ptr);
+            // Read page table from DRAM
+            if constexpr (!is_page_table_sharded) {
+                page_table_cb_wr_ptr = get_write_ptr(cb_id_page_table);
+                const auto page_table_gen = TensorAccessor(page_table_args, page_table_addr, page_table_page_size);
+                uint64_t page_table_noc_addr = page_table_gen.get_noc_addr((cur_batch / q_heads_parallel_factor));
+                noc_async_read(page_table_noc_addr, page_table_cb_wr_ptr, page_table_page_size);
+                noc_async_read_barrier();
+                page_table_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(page_table_cb_wr_ptr);
+                page_table_ptr_u32 = page_table_ptr;
+
+            } else {  // Read page table from dyanmically allocated L1 buffer
+                page_table_cb_wr_ptr =
+                    get_write_ptr(cb_id_page_table) + (cur_batch / q_heads_parallel_factor) * page_table_page_size;
+                page_table_ptr_u16 = reinterpret_cast<volatile tt_l1_ptr uint16_t*>(page_table_cb_wr_ptr);
+            }
+
+            cb_push_back(cb_id_page_table, num_pages_to_read);
         }
-
-        cb_push_back(cb_id_page_table, num_pages_to_read);
     }
 
     for (uint32_t cur_head = cur_head_group * num_heads_per_core;
@@ -271,6 +333,7 @@ void kernel_main() {
                 const uint32_t k_chunk_start_row_num = k_chunk * Sk_chunk_t_dynamic;
                 uint64_t k_base_read_ptr;
                 {
+                    DeviceZoneScopedN("read K chunk");
                     // Read K chunk in row-major order (to simplify page mapping). Write tiles to CB in transposed
                     // order.
                     cb_reserve_back(cb_k_in, k_chunk_tiles);
@@ -292,10 +355,10 @@ void kernel_main() {
                             physical_k_tile_id += 1;                               // Go to next tile in row
                             k_write_ptr_col += Sk_chunk_t_dynamic * k_tile_bytes;  // Go to next column in CB
 
-                            if (++barrier_count == barrier_threshold) {
-                                noc_async_read_barrier();
-                                barrier_count = 0;
-                            }
+                            // if (++barrier_count == barrier_threshold) {
+                            //     noc_async_read_barrier();
+                            //     barrier_count = 0;
+                            // }
                         }
                     }
                     noc_async_read_barrier();
@@ -308,6 +371,7 @@ void kernel_main() {
                 }
 
                 {
+                    DeviceZoneScopedN("read V chunk");
                     if constexpr (reuse_k) {
                         // Read V chunk (tranpose of K), from K's L1 buffer
                         cb_reserve_back(cb_v_in, v_chunk_tiles);

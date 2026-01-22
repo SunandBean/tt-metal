@@ -10,6 +10,68 @@ from tests.tt_eager.python_api_testing.unit_testing.misc.test_flash_multi_latent
 )
 
 
+# Original Q: (1, 4, 128, 576) -> (S, B, H, D)
+# We need to replicate each 32-head chunk 4 times
+
+
+def create_replicated_q_shard_spec(device, batch, nh, d, num_cores_per_head=4):
+    """
+    Creates a memory config where Q is replicated within each reducer group.
+
+    The core list follows the SDPA program factory's interleaved pattern:
+    - Output cores (reducers) are at logical indices 0..num_output_cores-1
+    - Worker cores start at index num_output_cores
+    - For each virtual batch: [output_core, worker1, worker2, worker3]
+    """
+    q_heads_parallel_factor = 4  # 128 heads / 32 per virtual batch
+    num_virtual_batches = batch * q_heads_parallel_factor  # 4 * 4 = 16
+    num_output_cores = num_virtual_batches  # One output core per virtual batch
+
+    # Total cores needed = num_virtual_batches * num_cores_per_head
+    total_cores = num_virtual_batches * num_cores_per_head  # 16 * 4 = 64
+
+    # Shard shape: each core gets (32, D) = (TILE_HEIGHT, 576)
+    shard_height = ttnn.TILE_SIZE  # 32
+    shard_width = d  # 576
+
+    # Use device's actual grid size
+    grid_x = device.compute_with_storage_grid_size().x
+    grid_y = device.compute_with_storage_grid_size().y
+
+    print(f"grid_x: {grid_x}, grid_y: {grid_y}")
+
+    # Build core list in the exact SDPA order (matching program factory)
+    core_list = []
+
+    # Output cores are at the first num_output_cores logical positions
+    output_cores = [(i % grid_x, i // grid_x) for i in range(num_output_cores)]
+    worker_start = num_output_cores
+
+    print(f"output_cores: {output_cores}")
+    print(f"worker_start: {worker_start}")
+
+    for vbatch in range(num_virtual_batches):  # 16 virtual batches
+        # Output core (reducer) for this virtual batch
+        core_list.append(output_cores[vbatch])
+        # Worker cores (num_cores_per_head - 1 workers per virtual batch)
+        for w in range(1, num_cores_per_head):
+            worker_idx = worker_start + (vbatch * (num_cores_per_head - 1)) + (w - 1)
+            core_list.append((worker_idx % grid_x, worker_idx // grid_x))
+
+    print(f"core_list: {core_list}")
+    # Create core range set from the list
+    core_range_set = ttnn.CoreRangeSet(
+        [ttnn.CoreRange(ttnn.CoreCoord(x, y), ttnn.CoreCoord(x, y)) for x, y in core_list]
+    )
+    breakpoint()
+    return ttnn.create_sharded_memory_config(
+        shape=(shard_height, shard_width),
+        core_grid=core_range_set,
+        strategy=ttnn.ShardStrategy.HEIGHT,
+        use_height_and_width_as_shard_shape=True,
+    )
+
+
 @pytest.mark.parametrize(
     "batch",
     [
@@ -21,7 +83,7 @@ from tests.tt_eager.python_api_testing.unit_testing.misc.test_flash_multi_latent
 @pytest.mark.parametrize(
     "seq_len",
     [
-        128,  # Long sequence length
+        1024,  # Long sequence length
     ],
 )
 @pytest.mark.parametrize(
@@ -70,6 +132,12 @@ from tests.tt_eager.python_api_testing.unit_testing.misc.test_flash_multi_latent
     ],
 )
 @pytest.mark.parametrize(
+    "q_custom_shard",
+    [
+        True,
+    ],
+)
+@pytest.mark.parametrize(
     "use_paged_attention",
     [
         # False,
@@ -93,6 +161,7 @@ def test_flash_mla_decode_stress(
     d_rope,
     q_num_cores,
     q_dtype,
+    q_custom_shard,
     dtype,
     use_paged_attention,
     block_size,
@@ -116,6 +185,10 @@ def test_flash_mla_decode_stress(
             f"Skipping test with nkv {nkv} not divisible by effective_num_cores {effective_num_cores} / batch {batch}."
         )
 
+    q_mem_config = (
+        create_replicated_q_shard_spec(device, batch, nh, kv_lora_rank + d_rope, 4) if q_custom_shard else None
+    )
+
     run_flash_mla_decode_impl(
         device,
         batch,
@@ -126,7 +199,10 @@ def test_flash_mla_decode_stress(
         d_rope,
         q_num_cores,
         q_dtype,
+        q_mem_config,
         dtype,
         use_paged_attention,
         block_size,
     )
+
+    ttnn.ReadDeviceProfiler(device)

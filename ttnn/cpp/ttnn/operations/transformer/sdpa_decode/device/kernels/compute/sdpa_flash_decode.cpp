@@ -8,6 +8,7 @@
 #define REDUCE_DIM (ReduceDim::REDUCE_ROW)
 
 #include "compute_kernel_api.h"
+#include "tools/profiler/kernel_profiler.hpp"
 #include "compute_kernel_api/eltwise_binary.h"
 #include "compute_kernel_api/eltwise_unary/exp.h"
 #include "compute_kernel_api/eltwise_unary/recip.h"
@@ -111,6 +112,22 @@ void MAIN {
     const uint32_t core_num_in_output = get_arg_val<uint32_t>(arg_idx++);
     const uint32_t cur_pos_arg = get_arg_val<uint32_t>(arg_idx++);
 
+    // DPRINT << "do_reduce: " << static_cast<uint32_t>(do_reduce) << ENDL();
+    // DPRINT << "apply_mask_at_last_chunk: " << static_cast<uint32_t>(apply_mask_at_last_chunk) << ENDL();
+    // DPRINT << "do_output: " << static_cast<uint32_t>(do_output) << ENDL();
+    // DPRINT << "cur_head: " << cur_head << ENDL();
+    // DPRINT << "cur_batch: " << cur_batch << ENDL();
+    // DPRINT << "core_num_in_reduce: " << core_num_in_reduce << ENDL();
+    // DPRINT << "core_num_in_output: " << core_num_in_output << ENDL();
+    // DPRINT << "cur_pos_arg: " << cur_pos_arg << ENDL();
+    // DPRINT << "St: " << St << ENDL();
+    // DPRINT << "DHt: " << DHt << ENDL();
+    // DPRINT << "vDHt: " << vDHt << ENDL();
+    // DPRINT << "Sq_chunk_t: " << Sq_chunk_t << ENDL();
+    // DPRINT << "Sk_chunk_t: " << Sk_chunk_t << ENDL();
+    // DPRINT << "qk_in0_block_w: " << qk_in0_block_w << ENDL();
+    // DPRINT << "qk_subblock_w: " << qk_subblock_w << ENDL();
+
     // Idle core
     // get_arg_val<uint32_t>(0) can go from 0-63 for the core_num; for active cores 65 is out of range so 65 indicates
     // an idle_core
@@ -162,21 +179,36 @@ void MAIN {
         num_cores_to_wait = k_num_chunks - 1;
     }
 
-    // We tilize input Q if it is in ROW MAJOR layout
-    if constexpr (tilize_q) {
-        compute_kernel_hw_startup(cb_q_rm, cb_q_in);
-        tilize_init(cb_q_rm, q_chunk_tiles, cb_q_in);
-        cb_wait_front(cb_q_rm, q_chunk_tiles);
-        cb_reserve_back(cb_q_in, q_chunk_tiles);
-        tilize_block(cb_q_rm, q_chunk_tiles, cb_q_in);
-        tilize_uninit(cb_q_rm, cb_q_in);
-        cb_push_back(cb_q_in, q_chunk_tiles);
-        cb_pop_front(cb_q_rm, q_chunk_tiles);
-        mm_init_short(cb_q_in, cb_k_in);
-    } else {
-        mm_init(cb_q_in, cb_k_in, cb_qk_im);
+    {
+        DeviceZoneScopedN("Tilize Q");
+        // We tilize input Q if it is in ROW MAJOR layout
+        if constexpr (tilize_q) {
+            compute_kernel_hw_startup(cb_q_rm, cb_q_in);
+            tilize_init(cb_q_rm, q_chunk_tiles, cb_q_in);
+            cb_wait_front(cb_q_rm, q_chunk_tiles);
+            cb_reserve_back(cb_q_in, q_chunk_tiles);
+            tilize_block(cb_q_rm, q_chunk_tiles, cb_q_in);
+            tilize_uninit(cb_q_rm, cb_q_in);
+            cb_push_back(cb_q_in, q_chunk_tiles);
+            cb_pop_front(cb_q_rm, q_chunk_tiles);
+            mm_init_short(cb_q_in, cb_k_in);
+        } else {
+            mm_init(cb_q_in, cb_k_in, cb_qk_im);
+        }
+        cb_wait_front(cb_q_in, q_chunk_tiles);
     }
-    cb_wait_front(cb_q_in, q_chunk_tiles);
+
+    for (uint8_t r = 0; r < 32; ++r) {
+        SliceRange sr1 = SliceRange{
+            .h0 = static_cast<uint8_t>(r), .h1 = static_cast<uint8_t>(r + 1), .hs = 1, .w0 = 0, .w1 = 32, .ws = 1};
+        DPRINT_DATA0({
+            DPRINT << (uint)r << " --READ-- q_in-- "
+                   << TileSlice(cb_q_in, 0, sr1, TSLICE_INPUT_CB, TSLICE_RD_PTR, true, true) << ENDL();
+        });
+        DPRINT_UNPACK(
+            { DPRINT << (uint)r << " --READ-- q_in-- " << TileSlice(cb_q_in, 0, sr1, true, true) << ENDL(); });
+        DPRINT_PACK({ DPRINT << (uint)r << " --READ-- q_in-- " << TileSlice(cb_q_in, 0, sr1, true, true) << ENDL(); });
+    }
 
     // Define dynamic matmul configs
 #ifdef DYNAMIC_CHUNK_SIZE
@@ -291,43 +323,49 @@ void MAIN {
                     mask_cb_to_use = cb_sliding_window_mask_in;  // Use sliding window mask buffer
                 }
 
-                cb_matmul_blocks(
-                    cb_q_in,
-                    cb_k_in,
-                    cb_qk_im,
-                    Sq_chunk_t,
-                    Sk_chunk_t_dynamic,
-                    DHt,
-                    qk_num_blocks,
-                    qk_in0_num_subblocks_dynamic,
-                    qk_in1_num_subblocks_dynamic,
-                    qk_in0_block_w,
-                    qk_subblock_h_dynamic,
-                    qk_subblock_w_dynamic,
-                    true,
-                    add_mask_fusion,
-                    mask_cb_to_use,
-                    cb_zero_in);
+                {
+                    DeviceZoneScopedN("QK matmul");
+                    cb_matmul_blocks(
+                        cb_q_in,
+                        cb_k_in,
+                        cb_qk_im,
+                        Sq_chunk_t,
+                        Sk_chunk_t_dynamic,
+                        DHt,
+                        qk_num_blocks,
+                        qk_in0_num_subblocks_dynamic,
+                        qk_in1_num_subblocks_dynamic,
+                        qk_in0_block_w,
+                        qk_subblock_h_dynamic,
+                        qk_subblock_w_dynamic,
+                        true,
+                        add_mask_fusion,
+                        mask_cb_to_use,
+                        cb_zero_in);
+                }
 
                 /* QK += MASK */
-                if (!add_mask_fusion) {
-                    if constexpr (is_causal) {
-                        // For decode, we only apply mask at the last chunk for causal mode
-                        if (k_chunk == k_chunk_end - 1 && apply_mask_at_last_chunk) {
-                            reconfig_data_format(cb_qk_im, cb_mask_in);
-                            add_block_inplace<false>(cb_qk_im, cb_mask_in, qk_chunk_tiles_dynamic);
+                {
+                    DeviceZoneScopedN("QK+=mask");
+                    if (!add_mask_fusion) {
+                        if constexpr (is_causal) {
+                            // For decode, we only apply mask at the last chunk for causal mode
+                            if (k_chunk == k_chunk_end - 1 && apply_mask_at_last_chunk) {
+                                reconfig_data_format(cb_qk_im, cb_mask_in);
+                                add_block_inplace<false>(cb_qk_im, cb_mask_in, qk_chunk_tiles_dynamic);
+                            }
+                        } else {
+                            if constexpr (use_attention_mask) {
+                                reconfig_data_format(cb_qk_im, cb_mask_in);
+                                add_block_inplace<true>(cb_qk_im, cb_mask_in, qk_chunk_tiles_dynamic);
+                            }
                         }
-                    } else {
-                        if constexpr (use_attention_mask) {
-                            reconfig_data_format(cb_qk_im, cb_mask_in);
-                            add_block_inplace<true>(cb_qk_im, cb_mask_in, qk_chunk_tiles_dynamic);
-                        }
-                    }
 
-                    // Apply sliding window mask to the first chunk (only on the core that processes it)
-                    if (k_chunk == window_start_chunk && window_start_unaligned > 0) {
-                        reconfig_data_format(cb_qk_im, cb_sliding_window_mask_in);
-                        add_block_inplace<false>(cb_qk_im, cb_sliding_window_mask_in, qk_chunk_tiles_dynamic);
+                        // Apply sliding window mask to the first chunk (only on the core that processes it)
+                        if (k_chunk == window_start_chunk && window_start_unaligned > 0) {
+                            reconfig_data_format(cb_qk_im, cb_sliding_window_mask_in);
+                            add_block_inplace<false>(cb_qk_im, cb_sliding_window_mask_in, qk_chunk_tiles_dynamic);
+                        }
                     }
                 }
 
@@ -349,8 +387,16 @@ void MAIN {
                  * else:
                  *  cur_max = max(qk, dim=-1)
                  */
-                reduce_c<PoolType::MAX, ReduceDim::REDUCE_ROW, cb_qk_im, cb_identity_scale_in, Sq_chunk_t, vector_mode>(
-                    cb_cur_max, cb_prev_max, Sk_chunk_t_dynamic, k_chunk > k_chunk_start);
+                {
+                    DeviceZoneScopedN("Reduce C max");
+                    reduce_c<
+                        PoolType::MAX,
+                        ReduceDim::REDUCE_ROW,
+                        cb_qk_im,
+                        cb_identity_scale_in,
+                        Sq_chunk_t,
+                        vector_mode>(cb_cur_max, cb_prev_max, Sk_chunk_t_dynamic, k_chunk > k_chunk_start);
+                }
 
                 /* QK -= cb_cur_max */
                 /* QK = exp(QK)*/
@@ -360,12 +406,15 @@ void MAIN {
                 /**
                  * sub_exp performs `QK = exp((QK - cur_max) * scale)`
                  */
-                sub_exp_block_bcast_cols_inplace_reduce<
-                    cb_qk_im,
-                    Sq_chunk_t,
-                    scale_fp32,
-                    vector_mode,
-                    cb_identity_scale_in>(cb_cur_max, cb_cur_sum, Sk_chunk_t_dynamic);
+                {
+                    DeviceZoneScopedN("Sub exp QK");
+                    sub_exp_block_bcast_cols_inplace_reduce<
+                        cb_qk_im,
+                        Sq_chunk_t,
+                        scale_fp32,
+                        vector_mode,
+                        cb_identity_scale_in>(cb_cur_max, cb_cur_sum, Sk_chunk_t_dynamic);
+                }
                 cb_wait_front(cb_qk_im, qk_chunk_tiles_dynamic);
 
                 // Reconfig register DF
@@ -373,29 +422,41 @@ void MAIN {
                 pack_reconfig_data_format(cb_cur_sum);
 
                 /* reduce_c performs CUR_SUM = sum(QK, dim = -1) */
-                reduce_c<PoolType::SUM, ReduceDim::REDUCE_ROW, cb_qk_im, cb_identity_scale_in, Sq_chunk_t, vector_mode>(
-                    cb_cur_sum, cb_cur_sum, Sk_chunk_t_dynamic, false);
+                {
+                    DeviceZoneScopedN("Reduce C sum");
+                    reduce_c<
+                        PoolType::SUM,
+                        ReduceDim::REDUCE_ROW,
+                        cb_qk_im,
+                        cb_identity_scale_in,
+                        Sq_chunk_t,
+                        vector_mode>(cb_cur_sum, cb_cur_sum, Sk_chunk_t_dynamic, false);
+                }
 
                 /* OUT_IM = QK @ V_CHUNK */
                 reconfig_data_format(cb_qk_im, cb_v_in);  // DEBUG
                 pack_reconfig_data_format(cb_out_im);
-                cb_matmul_blocks(
-                    cb_qk_im,
-                    cb_v_in,
-                    cb_out_mm,
-                    Sq_chunk_t,
-                    vDHt,
-                    Sk_chunk_t_dynamic,
-                    out_num_blocks_dynamic,
-                    out_in0_num_subblocks,
-                    out_in1_num_subblocks,
-                    out_in0_block_w_dynamic,
-                    out_subblock_h,
-                    out_subblock_w,
-                    false /*transpose*/,
-                    false,
-                    cb_mask_in,
-                    cb_zero_in);
+
+                {
+                    DeviceZoneScopedN("Out V matmul");
+                    cb_matmul_blocks(
+                        cb_qk_im,
+                        cb_v_in,
+                        cb_out_mm,
+                        Sq_chunk_t,
+                        vDHt,
+                        Sk_chunk_t_dynamic,
+                        out_num_blocks_dynamic,
+                        out_in0_num_subblocks,
+                        out_in1_num_subblocks,
+                        out_in0_block_w_dynamic,
+                        out_subblock_h,
+                        out_subblock_w,
+                        false /*transpose*/,
+                        false,
+                        cb_mask_in,
+                        cb_zero_in);
+                }
 
                 // Reconfig register DF
                 reconfig_data_format_srca(cb_out_im);
@@ -412,11 +473,17 @@ void MAIN {
                     pack_reconfig_data_format(cb_exp_max_diff);
 
                     /* EXP_MAX_DIFF = exp(PREV_MAX - CUR_MAX) */
-                    sub_exp_block<scale_fp32, vector_mode>(cb_prev_max, cb_cur_max, cb_exp_max_diff, Sq_chunk_t);
-                    cb_pop_front(cb_prev_max, Sq_chunk_t);
+                    {
+                        DeviceZoneScopedN("Exp diff");
+                        sub_exp_block<scale_fp32, vector_mode>(cb_prev_max, cb_cur_max, cb_exp_max_diff, Sq_chunk_t);
+                        cb_pop_front(cb_prev_max, Sq_chunk_t);
+                    }
 
                     /* PREV_SUM *= EXP_MAX_DIFF */
-                    mul_block_inplace(cb_prev_sum, cb_exp_max_diff, Sq_chunk_t);
+                    {
+                        DeviceZoneScopedN("Prev sum *= exp diff");
+                        mul_block_inplace(cb_prev_sum, cb_exp_max_diff, Sq_chunk_t);
+                    }
 
                     /* OUT_ACC *= EXP_MAX_DIFF */
                     reconfig_data_format(cb_out_accumulate_im, cb_exp_max_diff);
@@ -436,20 +503,26 @@ void MAIN {
 
                 if (k_chunk < k_chunk_end - 1 || do_reduce) {
                     // Move intermediate sum and max values to appropriate ping pong buffers
-                    reconfig_data_format(cb_cur_max, cb_cur_max);
-                    pack_reconfig_data_format(cb_prev_max);
+                    {
+                        DeviceZoneScopedN("move blocks intermediate");
+                        reconfig_data_format(cb_cur_max, cb_cur_max);
+                        pack_reconfig_data_format(cb_prev_max);
 
-                    // PREV_MAX <- CUR_MAX
-                    move_block<true>(cb_cur_max, cb_prev_max, Sq_chunk_t);
+                        // PREV_MAX <- CUR_MAX
+                        move_block<true>(cb_cur_max, cb_prev_max, Sq_chunk_t);
 
-                    // PREV_SUM <- CUR_SUM
-                    move_block<true>(cb_cur_sum, cb_prev_sum, Sq_chunk_t);
+                        // PREV_SUM <- CUR_SUM
+                        move_block<true>(cb_cur_sum, cb_prev_sum, Sq_chunk_t);
+                    }
                 } else {
                     // Write results OUT_ACC, CUR_MAX, CUR_SUM to designated
                     // Write o, m, l into cb_out
-                    move_block<true>(cb_out_accumulate_im, cb_out_o, out_chunk_tiles);
-                    move_block<true>(cb_cur_max, cb_out_m, Sq_chunk_t);
-                    move_block<true>(cb_cur_sum, cb_out_l, Sq_chunk_t);
+                    {
+                        DeviceZoneScopedN("move blocks final");
+                        move_block<true>(cb_out_accumulate_im, cb_out_o, out_chunk_tiles);
+                        move_block<true>(cb_cur_max, cb_out_m, Sq_chunk_t);
+                        move_block<true>(cb_cur_sum, cb_out_l, Sq_chunk_t);
+                    }
                 }
             }
         }
@@ -464,7 +537,10 @@ void MAIN {
                 // We need to wait for them and send to reducer's compute
                 // Iterate through each worker
                 for (uint32_t i = 0; i < num_cores_to_wait; i++) {
-                    move_block<true>(cb_l_in, cb_prev_sum_2, Sq_chunk_t);
+                    {
+                        DeviceZoneScopedN("reduce move blocks ");
+                        move_block<true>(cb_l_in, cb_prev_sum_2, Sq_chunk_t);
+                    }
 
                     // Fused Softmax Correction
                     // * Fused Correction is a fused operation that performs the following steps:
@@ -475,34 +551,45 @@ void MAIN {
                     // * 5. PREV_SUM *= EXP_MAX_DIFF
                     // * 6. CUR_SUM = PREV_SUM_2 + PREV_SUM
                     // */
-                    correction_block<scale_fp32, vector_mode>(
-                        cb_m_in,        // cb worker max
-                        cb_prev_sum_2,  // cb worker sum
-                        cb_cur_max,
-                        cb_prev_max,
-                        cb_cur_sum,
-                        cb_prev_sum,
-                        cb_exp_max_diff,
-                        cb_exp_max_diff_2,
-                        Sq_chunk_t);
-
+                    {
+                        DeviceZoneScopedN("reduce correction");
+                        correction_block<scale_fp32, vector_mode>(
+                            cb_m_in,        // cb worker max
+                            cb_prev_sum_2,  // cb worker sum
+                            cb_cur_max,
+                            cb_prev_max,
+                            cb_cur_sum,
+                            cb_prev_sum,
+                            cb_exp_max_diff,
+                            cb_exp_max_diff_2,
+                            Sq_chunk_t);
+                    }
                     // OUT_ACC_2 <- WORKER_OUT
                     move_block<true>(cb_out_o, cb_out_accumulate_im_2, out_chunk_tiles);
 
                     // OUT_ACC_2 *= EXP_MAX_DIFF
                     // OUT_ACC *= EXP_MAX_DIFF_2
-                    mul_block_bcast_cols_inplace(cb_out_accumulate_im, cb_exp_max_diff, Sq_chunk_t, vDHt);
-                    mul_block_bcast_cols_inplace(cb_out_accumulate_im_2, cb_exp_max_diff_2, Sq_chunk_t, vDHt);
+                    {
+                        DeviceZoneScopedN("reduce mul");
+                        mul_block_bcast_cols_inplace(cb_out_accumulate_im, cb_exp_max_diff, Sq_chunk_t, vDHt);
+                        mul_block_bcast_cols_inplace(cb_out_accumulate_im_2, cb_exp_max_diff_2, Sq_chunk_t, vDHt);
+                    }
 
                     // OUT_ACC = OUT_ACC + OUT_ACC_2
-                    add_block_inplace<true>(cb_out_accumulate_im, cb_out_accumulate_im_2, out_chunk_tiles);
+                    {
+                        DeviceZoneScopedN("reduce add");
+                        add_block_inplace<true>(cb_out_accumulate_im, cb_out_accumulate_im_2, out_chunk_tiles);
+                    }
 
                     // PREV_MAX <- CUR_MAX
                     // PREV_SUM <- CUR_SUM
-                    cb_pop_front(cb_prev_max, Sq_chunk_t);
-                    cb_pop_front(cb_m_in, Sq_chunk_t);
-                    move_block<true>(cb_cur_max, cb_prev_max, Sq_chunk_t);
-                    move_block<true>(cb_cur_sum, cb_prev_sum, Sq_chunk_t);
+                    {
+                        DeviceZoneScopedN("reduce pop + move");
+                        cb_pop_front(cb_prev_max, Sq_chunk_t);
+                        cb_pop_front(cb_m_in, Sq_chunk_t);
+                        move_block<true>(cb_cur_max, cb_prev_max, Sq_chunk_t);
+                        move_block<true>(cb_cur_sum, cb_prev_sum, Sq_chunk_t);
+                    }
                 }
             }
 
@@ -535,7 +622,10 @@ void MAIN {
 
             reconfig_data_format(cb_cur_sum, cb_cur_sum);
             pack_reconfig_data_format(cb_cur_sum);
-            recip_block_inplace<vector_mode>(cb_cur_sum, Sq_chunk_t);
+            {
+                DeviceZoneScopedN("recip");
+                recip_block_inplace<vector_mode>(cb_cur_sum, Sq_chunk_t);
+            }
 
             /* OUT_ACC *= CUR_SUM */
             reconfig_data_format(cb_out_accumulate_im, cb_cur_sum);

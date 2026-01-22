@@ -6,7 +6,7 @@
 #include "ttnn/deprecated/tt_dnn/kernels/dataflow/generate_bcast_scalar.hpp"
 #include "ttnn/deprecated/tt_dnn/kernels/dataflow/generate_reduce_scaler.hpp"
 #include "api/debug/assert.h"
-
+#include "tools/profiler/kernel_profiler.hpp"
 #include "ttnn/operations/transformer/sdpa_decode/device/kernels/rt_args_common.hpp"
 #include "dataflow_common.hpp"
 
@@ -135,10 +135,12 @@ void kernel_main() {
 
     // generate and send scaler to compute
     // These helper functions respect tile size of CBs (ie. no need for special handling of tiny tiles)
-    generate_reduce_scaler(cb_identity_scale_in, identity_scalar_packed);
-    generate_reduce_scaler(cb_zero_in, zero_scalar_packed);
-    generate_bcast_col_scalar(cb_col_identity, identity_scalar_packed);
-
+    {
+        DeviceZoneScopedN("write scaler");
+        generate_reduce_scaler(cb_identity_scale_in, identity_scalar_packed);
+        generate_reduce_scaler(cb_zero_in, zero_scalar_packed);
+        generate_bcast_col_scalar(cb_col_identity, identity_scalar_packed);
+    }
     if (k_chunk_start == window_start_chunk && window_start_unaligned > 0) {
         // If this core processes the first chunk and we need to apply sliding window mask, generate it here
         generate_sliding_window_mask<cb_sliding_window_mask_in, PNHt>(
@@ -187,34 +189,40 @@ void kernel_main() {
             // reducer's compute Wait for compute to deliver output chunk, and write to compute again for reduction data
             // in cb_intermed_out is arranged as [o,m,l,o,m,l,...] with size (out_chunk_tiles +
             // 2*PNHt)*num_cores_to_wait wait on in0 semaphore value to become VALID (set by sender)
-            noc_semaphore_wait(in0_receiver_semaphore_addr_ptr, num_cores_to_wait);
-            // noc_semaphore_set(in0_receiver_semaphore_addr_ptr, 0);
+            {
+                DeviceZoneScopedN("wait on in0 semaphore");
+                noc_semaphore_wait(in0_receiver_semaphore_addr_ptr, num_cores_to_wait);
+                // noc_semaphore_set(in0_receiver_semaphore_addr_ptr, 0);
 
-            // cb_wait_front(cb_intermed_out, num_tiles_to_wait);
+                // cb_wait_front(cb_intermed_out, num_tiles_to_wait);
+            }
             constexpr uint32_t q_read_size = out_chunk_tiles * tile_bytes_intermed;
             constexpr uint32_t ml_read_size = PNHt * tile_bytes_intermed;
             for (uint32_t block = 0; block < num_cores_to_wait; ++block) {
-                cb_reserve_back(cb_out_o, out_chunk_tiles);
-                cb_reserve_back(cb_m_in, PNHt);
-                cb_reserve_back(cb_l_in, PNHt);
+                {
+                    DeviceZoneScopedN("write collect stats");
+                    cb_reserve_back(cb_out_o, out_chunk_tiles);
+                    cb_reserve_back(cb_m_in, PNHt);
+                    cb_reserve_back(cb_l_in, PNHt);
 
-                uint32_t m_write_ptr = get_read_ptr(cb_m_in);
-                noc_async_read(intermed_l1_read_addr, m_write_ptr, ml_read_size);
-                intermed_l1_read_addr += ml_read_size;
-                noc_async_read_barrier();
-                cb_push_back(cb_m_in, PNHt);
+                    uint32_t m_write_ptr = get_read_ptr(cb_m_in);
+                    noc_async_read(intermed_l1_read_addr, m_write_ptr, ml_read_size);
+                    intermed_l1_read_addr += ml_read_size;
+                    noc_async_read_barrier();
+                    cb_push_back(cb_m_in, PNHt);
 
-                uint32_t l_write_ptr = get_read_ptr(cb_l_in);
-                noc_async_read(intermed_l1_read_addr, l_write_ptr, ml_read_size);
-                intermed_l1_read_addr += ml_read_size;
-                noc_async_read_barrier();
-                cb_push_back(cb_l_in, PNHt);
+                    uint32_t l_write_ptr = get_read_ptr(cb_l_in);
+                    noc_async_read(intermed_l1_read_addr, l_write_ptr, ml_read_size);
+                    intermed_l1_read_addr += ml_read_size;
+                    noc_async_read_barrier();
+                    cb_push_back(cb_l_in, PNHt);
 
-                uint32_t q_write_ptr = get_read_ptr(cb_out_o);
-                noc_async_read(intermed_l1_read_addr, q_write_ptr, q_read_size);
-                intermed_l1_read_addr += q_read_size;
-                noc_async_read_barrier();
-                cb_push_back(cb_out_o, out_chunk_tiles);
+                    uint32_t q_write_ptr = get_read_ptr(cb_out_o);
+                    noc_async_read(intermed_l1_read_addr, q_write_ptr, q_read_size);
+                    intermed_l1_read_addr += q_read_size;
+                    noc_async_read_barrier();
+                    cb_push_back(cb_out_o, out_chunk_tiles);
+                }
             }
         }
         // Offset for current batch
@@ -300,9 +308,12 @@ void kernel_main() {
             }
         } else {
             // if mqa, we don't need to gather outputs for other heads so we can just write entire tiles to memory
-            if (!is_out_sharded) {
-                barrier_count = write_tiles_to_memory<cb_out, out_chunk_tiles, barrier_threshold>(
-                    out_tile_id, out_writer, barrier_count);
+            {
+                DeviceZoneScopedN("write out");
+                if (!is_out_sharded) {
+                    barrier_count = write_tiles_to_memory<cb_out, out_chunk_tiles, barrier_threshold>(
+                        out_tile_id, out_writer, barrier_count);
+                }
             }
         }
         if constexpr (num_kv_heads > 1 || !is_out_sharded) {

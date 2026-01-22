@@ -75,8 +75,8 @@ SdpaDecodeProgramFactory::cached_program_t SdpaDecodeProgramFactory::create(
     const auto& q_shape_unpadded = input_tensor_q.logical_shape();
     const auto& k_shape = input_tensor_k.padded_shape();
     // Use k_shape for S and DH since Q might be different for decode
+    // B comes from q_shape[1], PNH from q_shape[2] (may include replication factor for MLA)
     uint32_t B = q_shape[1], PNH = q_shape[2], S = k_shape[2], DH = k_shape[3];
-
     uint32_t num_kv_heads = k_shape[1];
     uint32_t num_q_heads = q_shape_unpadded[2];
     uint32_t page_block_size_t = 0;
@@ -88,6 +88,17 @@ SdpaDecodeProgramFactory::cached_program_t SdpaDecodeProgramFactory::create(
     uint32_t q_heads_parallel_factor = 1;
     if (is_q_sharded && use_mla) {
         uint32_t q_shard_height = input_tensor_q.memory_config().shard_spec()->shape[0];
+
+        // When Q is replicated for local reads, q_shape[2] = original_heads * num_cores_per_head
+        // The num_cores_per_head (replication factor) comes from max_cores_per_head_batch in program_config
+        uint32_t num_cores_per_head_config = program_config.has_value() ? program_config->max_cores_per_head_batch : 1;
+
+        // Derive original number of Q heads from the replicated tensor
+        // If Q is replicated: num_q_heads = q_shape[2] / replication_factor
+        // If Q is not replicated: num_q_heads = q_shape[2] (replication_factor = 1)
+        num_q_heads = PNH / num_cores_per_head_config;
+        PNH = num_q_heads;  // Reset PNH to original head count for calculations
+
         q_heads_parallel_factor = std::max((uint32_t)1, (num_q_heads + q_shard_height - 1) / q_shard_height);
 
         if (q_heads_parallel_factor > 1) {
@@ -476,10 +487,14 @@ SdpaDecodeProgramFactory::cached_program_t SdpaDecodeProgramFactory::create(
 
     // CBs
     // Q input
+    CBHandle cb_in0_id = 0;
     auto c_in0_config = CircularBufferConfig(q_tiles * q_tile_size, {{CBIndex::c_0, q_df}})
                             .set_page_size(CBIndex::c_0, q_tile_size)
                             .set_tile_dims(CBIndex::c_0, q_tile);
-    CreateCircularBuffer(program, core_grid, c_in0_config);
+    if (is_q_sharded) {
+        c_in0_config.set_globally_allocated_address(*q_buffer);
+    }
+    cb_in0_id = CreateCircularBuffer(program, core_grid, c_in0_config);
 
     // K input
     auto c_in1_config =
@@ -1027,6 +1042,7 @@ SdpaDecodeProgramFactory::cached_program_t SdpaDecodeProgramFactory::create(
          .num_cores_per_batch = num_cores_per_batch,
          .num_cores_per_head = num_cores_per_head,
          .num_output_cores = num_output_cores,
+         .cb_in0_id = cb_in0_id,
          .cb_in8_id = cb_in8_id,
          .cb_in9_id = cb_in9_id,
          .is_output_sharded = is_output_sharded,
@@ -1056,6 +1072,7 @@ void SdpaDecodeProgramFactory::override_runtime_arguments(
     const auto& compute_kernels_id = shared_variables.compute_kernels_id;
     const auto& num_cores_per_batch = shared_variables.num_cores_per_batch;
     const auto& num_cores_per_head = shared_variables.num_cores_per_head;
+    const auto& cb_in0_id = shared_variables.cb_in0_id;
     const auto& cb_in8_id = shared_variables.cb_in8_id;
     const auto& cb_in9_id = shared_variables.cb_in9_id;
     const auto& is_output_sharded = shared_variables.is_output_sharded;
@@ -1068,7 +1085,7 @@ void SdpaDecodeProgramFactory::override_runtime_arguments(
     const bool is_paged_attention = shared_variables.is_paged_attention;
     const bool is_causal = shared_variables.is_causal;
     const bool use_mla = shared_variables.use_mla;
-
+    const bool is_q_sharded = tensor_args.q.is_sharded();
     auto* q_buffer = tensor_args.q.buffer();
     auto* k_buffer = tensor_args.k.buffer();
     auto* v_buffer = use_mla ? k_buffer : tensor_args.v.value().buffer();
@@ -1152,6 +1169,9 @@ void SdpaDecodeProgramFactory::override_runtime_arguments(
         compute_args[arg_idx++] = core_num_in_reduce;
         compute_args[arg_idx++] = core_num_in_output;
         compute_args[arg_idx++] = cur_pos;
+    }
+    if (is_q_sharded) {
+        UpdateDynamicCircularBufferAddress(program, cb_in0_id, *q_buffer);
     }
     if (use_cur_pos_tensor and cur_pos_tensor.value().is_sharded()) {
         UpdateDynamicCircularBufferAddress(program, cb_in8_id, *cur_pos_tensor.value().buffer());
