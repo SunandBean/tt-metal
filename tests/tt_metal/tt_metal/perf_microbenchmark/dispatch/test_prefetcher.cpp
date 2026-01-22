@@ -1965,6 +1965,8 @@ TEST_P(RandomTestFixture, RandomTest) {
 // This test targets relay linear H command: PREFETCH_H (MMIO) -> PREFETCH_D (Remote) -> DISPATCHER (Remote)
 // Note: CQ_PREFETCH_CMD_RELAY_LINEAR_H needs to a standalone entry in fetchQ
 TEST_P(PrefetchRelayLinearHTestFixture, RelayLinearHTest) {
+    // Test failing with watcher gh issue
+    SKIP_FOR_WATCHER();
     log_info(tt::LogTest, "PrefetchRelayLinearHTestFixture - RelayLinearHTest - Test Start");
 
     // Test parameters
