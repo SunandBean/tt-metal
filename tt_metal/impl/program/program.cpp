@@ -639,7 +639,7 @@ void detail::ProgramImpl::update_kernel_groups(uint32_t programmable_core_type_i
                                                 HalProgrammableCoreType::TENSIX));
 
                                         std::string cb_ids;
-                                        for (int i = 0; i < max_cbs_; i++) {
+                                        for (uint32_t i = 0; i < max_cbs_; i++) {
                                             if (non_contiguous_cbs & (1ULL << i)) {
                                                 if (!cb_ids.empty()) {
                                                     cb_ids += ",";
