@@ -38,7 +38,10 @@ namespace ckernel {
  * | ntiles    | The number of tiles to wait for      | uint32_t | It must be less or equal than the size of the CB (the total number of tiles that fit into the CB) | True     |
  * */
 // clang-format on
-ALWI void cb_wait_front(uint32_t cbid, uint32_t ntiles) { UNPACK((llk_wait_tiles(cbid, ntiles))); }
+ALWI void cb_wait_front(uint32_t cbid, uint32_t ntiles) {
+    DPRINT << "cb_wait_front " << cbid << " " << ntiles << ENDL();
+    UNPACK((llk_wait_tiles(cbid, ntiles)));
+}
 
 // clang-format off
 /**
@@ -121,7 +124,10 @@ ALWI void cb_reserve_back(uint32_t cbid, uint32_t ntiles) {
  * | ntiles    | The number of tiles to be pushed     | uint32_t | It must be less or equal than the size of the CB (the total number of tiles that fit into the CB) | True     |
  */
 // clang-format on
-ALWI void cb_push_back(uint32_t cbid, uint32_t ntiles) { PACK((llk_push_tiles<false, false>(cbid, ntiles))); }
+ALWI void cb_push_back(uint32_t cbid, uint32_t ntiles) {
+    DPRINT << "cb_push_back " << cbid << " " << ntiles << ENDL();
+    PACK((llk_push_tiles<false, false>(cbid, ntiles)));
+}
 
 // clang-format off
 /**

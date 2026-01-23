@@ -195,6 +195,8 @@ def test_kv_cache_branch(device, epsilon, use_fp32):
         memory_config=cos_sin_mem_config,
         tile=rope_tile,
     )
+    print(tt_cos.shape)
+    print(tt_sin.shape)
     print("hi", tt_cos.memory_config().shard_spec.grid)
 
     # Transformation matrix - standard 32x32 tile
@@ -270,7 +272,6 @@ def test_kv_cache_branch(device, epsilon, use_fp32):
         torch_sin,
         position_ids_expanded,
         epsilon=epsilon,
-        fp32_dest_acc_en=use_fp32,
     )
 
     # TODO: Check if outputs are close

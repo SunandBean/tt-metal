@@ -129,7 +129,9 @@ struct Gather {
             // ================================================================
             // BRISC (Receiver) - DataMovementProcessor.RISCV_0
             // ================================================================
+            DPRINT << "receiver waiting for data" << ENDL();
             if constexpr (IsReceiverCore) {
+                DPRINT << " CODE IS ACTIVE" << args.dst_cb << " " << args.dst_num_pages << ENDL();
                 // Reserve space in destination CB
                 cb_reserve_back(args.dst_cb, args.dst_num_pages);
 

@@ -193,9 +193,7 @@ void cb_push_back(const int32_t operand, const int32_t num_pages) {
 
     volatile tt_reg_ptr uint32_t* pages_received_ptr = get_cb_tiles_received_ptr(operand);
     pages_received_ptr[0] += num_pages;
-
     get_local_cb_interface(operand).fifo_wr_ptr += num_words;
-
     // this will basically reset fifo_wr_ptr to fifo_addr -- no other wrap is legal
     // producer always writes into contiguous memory, it cannot wrap
     ASSERT(get_local_cb_interface(operand).fifo_wr_ptr <= get_local_cb_interface(operand).fifo_limit);
@@ -203,6 +201,7 @@ void cb_push_back(const int32_t operand, const int32_t num_pages) {
         // TODO: change this to fifo_wr_ptr
         get_local_cb_interface(operand).fifo_wr_ptr -= get_local_cb_interface(operand).fifo_size;
     }
+    DPRINT << "cb_push_back " << operand << " " << num_pages << ENDL();
 }
 
 // clang-format off
@@ -396,6 +395,7 @@ void cb_reserve_back(int32_t operand, int32_t num_pages) {
         free_space_pages = (int32_t)free_space_pages_wrap;
     } while (free_space_pages < num_pages);
     WAYPOINT("CRBD");
+    DPRINT << "cb_reserve_back " << operand << " " << num_pages << ENDL();
 }
 
 // clang-format off

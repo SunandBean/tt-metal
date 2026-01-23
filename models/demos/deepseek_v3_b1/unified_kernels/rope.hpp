@@ -100,20 +100,20 @@ struct Rope {
             constexpr uint32_t Wt = CTArgs::Wt;
             DPRINT << "rope ncrisc op Wt: " << Wt << ENDL();
             for (uint32_t ht = 0; ht < Ht; ht++) {
-                // cb_reserve_back(args.in_cb, Wt);
-                // cb_push_back(args.in_cb, Wt);
+                //            cb_reserve_back(args.in_cb, Wt);
+                //           cb_push_back(args.in_cb, Wt);
             }
 
             DPRINT << "rope ncrisc op reserve back trans_mat" << args.trans_mat_cb << ENDL();
-            // cb_reserve_back(args.trans_mat_cb, 1);
+            //             cb_reserve_back(args.trans_mat_cb, 1);
             DPRINT << "rope ncrisc op push back" << ENDL();
-            //  cb_push_back(args.trans_mat_cb, 1);
+            // cb_push_back(args.trans_mat_cb, 1);
 
-            //  cb_reserve_back(args.sin_cb, Wt);
-            //  cb_push_back(args.sin_cb, Wt);
-
-            //   cb_reserve_back(args.cos_cb, Wt);
-            //  cb_push_back(args.cos_cb, Wt);
+            //              cb_reserve_back(args.sin_cb, Wt);
+            //            cb_push_back(args.sin_cb, Wt);
+            //
+            ///          cb_reserve_back(args.cos_cb, Wt);
+            //            cb_push_back(args.cos_cb, Wt);
             DPRINT << "rope ncrisc op done" << ENDL();
 #elif defined(COMPILE_FOR_TRISC)
             DPRINT << "rope trisc op" << ENDL();
@@ -132,6 +132,14 @@ struct Rope {
             // ================================================================
             mm_init(args.in_cb, args.trans_mat_cb, args.rotated_in_interm_cb);
             binary_op_init_common(args.rotated_in_interm_cb, args.sin_cb, args.sin_interm_cb);
+            DPRINT << "args.in_cb: " << args.in_cb << ENDL();
+            DPRINT << "args.trans_mat_cb: " << args.trans_mat_cb << ENDL();
+            DPRINT << "args.sin_cb: " << args.sin_cb << ENDL();
+            DPRINT << "args.cos_cb: " << args.cos_cb << ENDL();
+            DPRINT << "args.rotated_in_interm_cb: " << args.rotated_in_interm_cb << ENDL();
+            DPRINT << "args.sin_interm_cb: " << args.sin_interm_cb << ENDL();
+            DPRINT << "args.cos_interm_cb: " << args.cos_interm_cb << ENDL();
+            DPRINT << "args.out_cb: " << args.out_cb << ENDL();
 
             // ================================================================
             // Main loop: process each head tile row
@@ -196,7 +204,7 @@ struct Rope {
                     pack_tile(j, args.cos_interm_cb, j);
                 }
                 tile_regs_release();
-                DPRINT << " cos interm cb push back " << Wt << ENDL();
+                DPRINT << " cos interm cb push back " << args.cos_interm_cb << " " << Wt << ENDL();
                 cb_push_back(args.cos_interm_cb, Wt);
                 DPRINT << " done push back " << ENDL();
                 cb_pop_front(args.in_cb, Wt);

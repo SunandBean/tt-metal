@@ -142,6 +142,7 @@ KERNEL_ENTRY {
         get_named_compile_time_arg_val("kv_rmsnorm_output_cb"),
         get_arg_val<uint32_t>(0),  // epsilon
     };
+
     using K_RopeCTArgs = deepseek_b1_ops::Rope::ComputeCTArgs<get_named_compile_time_arg_val("Wt")>;
 
     // CB indices (passed as runtime args to ComputeArgs)
@@ -185,6 +186,7 @@ KERNEL_ENTRY {
         constexpr uint32_t kv_rmsnorm_num_tiles = get_named_compile_time_arg_val("kv_rmsnorm_num_tiles");
         unified_kernels::setup_sharded_buffer(kv_rmsnorm_gamma_cb, kv_rmsnorm_num_tiles);
     }
+
     if constexpr (Core::is_krope_core) {
         constexpr uint32_t cos_cb = get_named_compile_time_arg_val("cos_cb");
         constexpr uint32_t sin_cb = get_named_compile_time_arg_val("sin_cb");
@@ -204,7 +206,6 @@ KERNEL_ENTRY {
         deepseek_b1_ops::Matmul::Op<DKV_MatmulCTArgs, Core::is_dkv_matmul_core, true, false> dkv_matmul;
         dkv_matmul(dkv_matmul_args);
     }
-
     // ========================================================================
     // Gather: dkv matmul cores (senders) -> input core (receiver)
     // NCRISC sends from knope grid of dkv matmul cores, BRISC receives on rmsnorm grid, TRISC no-op

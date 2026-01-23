@@ -132,7 +132,7 @@ class KVCacheBranch:
         rotated_input_interm_cb = 4  # 1x32 tile, 64 bytes (Wt tiles, intermediate)
         cos_interm_cb = 5  # 1x32 tile, 64 bytes (Wt tiles, intermediate)
         sin_interm_cb = 6  # 1x32 tile, 64 bytes (Wt tiles, intermediate)
-        dkv_matmul_input_cb = 0  # 1x32 tile, 64 bytes (224 tiles = 1x7168)
+        dkv_matmul_input_cb = 16  # 1x32 tile, 64 bytes (224 tiles = 1x7168)
         dkv_matmul_output_cb = 7  # 1x32 tile, 64 bytes (1 tile per core for rope input)
         dkv_matmul_weights_cb = 10  # 32x32 tile, 2048 bytes (sharded weights)
         kv_rmsnorm_input_cb = 11  # 16x32 tile, 1024 bytes (gathered data, 1 tile)
@@ -200,7 +200,6 @@ class KVCacheBranch:
 
         # Get NOC coordinates for gather destination (receiver core)
         dkv_gather_dest_noc_core = device.worker_core_from_logical_core(dkv_gather_receiver_core)
-        dkv_gather_data_size_bytes = dkv_matmul_input_page_size
 
         # Get number of sender cores (matmul grid)
         dkv_gather_sender_cores_list = ttnn.corerange_to_cores(dkv_gather_sender_grid, row_wise=True)
@@ -223,6 +222,7 @@ class KVCacheBranch:
         # SenderCTArgs: dest_noc_x, dest_noc_y, data_size_bytes, receiver_semaphore_id
         # Plus grid info for computing per-core offset
         dkv_gather_src_num_pages = dkv_matmul_out_w  # dkv matmul output tiles per core (must match matmul cb_push_back)
+        dkv_gather_data_size_bytes = dkv_gather_src_num_pages * dkv_matmul_input_page_size
         dkv_gather_sender_named_compile_time_args = [
             ("dkv_gather_dest_noc_x", dkv_gather_dest_noc_core.x),
             ("dkv_gather_dest_noc_y", dkv_gather_dest_noc_core.y),
@@ -237,6 +237,7 @@ class KVCacheBranch:
             ("dkv_gather_row_major", 1),  # 1 = row-major linearization
             ("dkv_gather_dst_cb", kv_rmsnorm_input_cb),  # Destination CB: write directly to kv_rmsnorm_input_cb
         ]
+        print(f"dkv_gather_sender_named_compile_time_args: {dkv_gather_sender_named_compile_time_args}")
 
         # Gather receiver compile-time args (named args for BRISC on kv rmsnorm core)
         # ReceiverCTArgs: noc0_num_senders, noc1_num_senders, noc0_receiver_semaphore_id, noc1_receiver_semaphore_id
@@ -248,8 +249,9 @@ class KVCacheBranch:
             ("dkv_gather_noc0_receiver_semaphore_id", gather_noc0_receiver_semaphore_id),
             ("dkv_gather_noc1_receiver_semaphore_id", gather_noc1_receiver_semaphore_id),
             ("dkv_gather_dst_cb", kv_rmsnorm_input_cb),
-            ("dkv_gather_dst_num_pages", kv_rmsnorm_num_tiles),
+            ("dkv_gather_dst_num_pages", dkv_gather_src_num_pages),
         ]
+        print(f"dkv_gather_receiver_named_compile_time_args: {dkv_gather_receiver_named_compile_time_args}")
 
         # ROPE
         krope_ncrisc_named_compile_time_args = [
@@ -321,10 +323,11 @@ class KVCacheBranch:
             tile=kv_rmsnorm_tile_descriptor,
         )
         kv_rmsnorm_input_cb_descriptor = ttnn.CBDescriptor(
-            total_size=kv_rmsnorm_num_tiles * kv_rmsnorm_page_size,
-            core_ranges=gamma_tensor.memory_config().shard_spec.grid,
+            total_size=1 * kv_rmsnorm_page_size,
+            core_ranges=dkv_gather_sender_grid,
             format_descriptors=[kv_rmsnorm_input_cb_format],
         )
+        print(kv_rmsnorm_num_tiles, kv_rmsnorm_page_size)
 
         # CB X: KV RMSNorm gamma buffer
         kv_rmsnorm_gamma_cb_descriptor = ttnn.cb_descriptor_from_sharded_tensor(kv_rmsnorm_gamma_cb, gamma_tensor)
@@ -377,21 +380,11 @@ class KVCacheBranch:
         krope_core_grid = cos_tensor.memory_config().shard_spec.grid
         # CB X: Cos (sharded tensor)
         cos_cb_descriptor = ttnn.cb_descriptor_from_sharded_tensor(cos_cb, cos_tensor)
-        print(f"cos_cb_descriptor: {cos_cb_descriptor.format_descriptors[0].tile}")
-        print(f"cos_cb_descriptor: {cos_cb_descriptor.format_descriptors[0].page_size}")
-        cos_cb_descriptor.format_descriptors[0].tile = krope_tile_descriptor
-        cos_cb_descriptor.format_descriptors[0].page_size = krope_tile_size
-        print(f"cos_cb_descriptor: {cos_cb_descriptor.format_descriptors[0].tile}")
-        print(f"cos_cb_descriptor: {cos_cb_descriptor.format_descriptors[0].page_size}")
-
         # CB X: Sin (sharded tensor)
         sin_cb_descriptor = ttnn.cb_descriptor_from_sharded_tensor(sin_cb, sin_tensor)
-        sin_cb_descriptor.format_descriptors[0].tile = krope_tile_descriptor
-        sin_cb_descriptor.format_descriptors[0].page_size = krope_tile_size
         # CB X: Trans_mat (sharded tensor)
         trans_mat_cb_descriptor = ttnn.cb_descriptor_from_sharded_tensor(trans_mat_cb, trans_mat_tensor)
-        trans_mat_cb_descriptor.format_descriptors[0].tile = krope_tile_descriptor
-        trans_mat_cb_descriptor.format_descriptors[0].page_size = krope_tile_size
+
         # CB X: Rotated input intermediate (not backed by tensor)
         rotated_interm_format = ttnn.CBFormatDescriptor(
             buffer_index=rotated_input_interm_cb,
@@ -431,6 +424,9 @@ class KVCacheBranch:
             core_ranges=krope_core_grid,
             format_descriptors=[sin_interm_format],
         )
+        print(" sin core grid: ", krope_core_grid)
+        print(" sin mem grid: ", sin_tensor.memory_config().shard_spec.grid)
+        print(" cos mem grid: ", cos_tensor.memory_config().shard_spec.grid)
 
         k_rope_output_cb_format = ttnn.CBFormatDescriptor(
             buffer_index=k_rope_output_cb,
