@@ -147,6 +147,32 @@ S8_CORES = [
 S_BLOCKS = [S1_CORES, S2_CORES, S3_CORES, S4_CORES, S5_CORES, S6_CORES, S7_CORES, S8_CORES]
 
 
+def get_s_block_physical_multicast_coords(device, s_block_idx: int) -> tuple:
+    """
+    Get multicast NOC coordinates for an S block in PHYSICAL coordinates.
+    Returns (start_x, start_y, end_x, end_y, num_mcast_dests).
+
+    Uses first core as start and last core as end. NOC is a torus architecture
+    so wraparound multicast (e.g., S4, S8) works correctly.
+    """
+    s_block_cores = S_BLOCKS[s_block_idx]
+
+    # First core = start coord (q1), last core = end coord (q8)
+    first_x, first_y = s_block_cores[0]
+    last_x, last_y = s_block_cores[-1]
+
+    # Convert to physical NOC coordinates
+    first_logical = ttnn.CoreCoord(first_x, first_y)
+    last_logical = ttnn.CoreCoord(last_x, last_y)
+    first_physical = device.worker_core_from_logical_core(first_logical)
+    last_physical = device.worker_core_from_logical_core(last_logical)
+
+    # Number of destinations for multicast (excluding sender)
+    num_mcast_dests = len(s_block_cores) - 1
+
+    return (first_physical.x, first_physical.y, last_physical.x, last_physical.y, num_mcast_dests)
+
+
 def get_s_block_core_range_set(s_block_idx: int) -> "ttnn.CoreRangeSet":
     """Get CoreRangeSet for a specific S block (0-indexed)."""
     cores = S_BLOCKS[s_block_idx]
@@ -353,6 +379,16 @@ class FlashMLADecode:
         # S1 has 8 cores: first B cores are output cores (hold Q shards), rest are workers
         s_block_idx = 0  # Use S1 for now
         s_block_cores = S_BLOCKS[s_block_idx]
+
+        # Get multicast coordinates for KV cache broadcast (in physical NOC space)
+        # NOC is a torus architecture, so wraparound multicast works correctly
+        (
+            mcast_start_x,
+            mcast_start_y,
+            mcast_end_x,
+            mcast_end_y,
+            num_mcast_dests,
+        ) = get_s_block_physical_multicast_coords(device, s_block_idx)
 
         # Validate S block has enough cores for the Q shards
         assert B <= len(
@@ -576,6 +612,13 @@ class FlashMLADecode:
             max_dynamic_chunk_size,  # 16
             1 if tilize_q else 0,  # 17
             q_chunk_size_bytes,  # 18
+            # Multicast coordinates (physical NOC coords from get_s_block_physical_multicast_coords)
+            mcast_start_x,  # 19
+            mcast_start_y,  # 20
+            mcast_end_x,  # 21
+            mcast_end_y,  # 22
+            num_mcast_dests,  # 23
+            2,  # 24: mcast_semaphore_id (semaphore for KV cache multicast)
         ]
         # TensorAccessorArgs for K, V (KV cache - can be interleaved or height-sharded), and pos tensor
         reader_compile_time_args.extend(get_tensor_accessor_args(kv_cache_tensor))  # K
@@ -919,6 +962,7 @@ class FlashMLADecode:
         semaphore_descriptors = [
             ttnn.SemaphoreDescriptor(0, ttnn.CoreType.WORKER, core_grid, 0),  # reducer_semaphore
             ttnn.SemaphoreDescriptor(1, ttnn.CoreType.WORKER, core_grid, 0),  # output_semaphore
+            ttnn.SemaphoreDescriptor(2, ttnn.CoreType.WORKER, core_grid, 0),  # mcast_semaphore for KV cache
         ]
 
         # =========================================================================
@@ -954,6 +998,9 @@ class FlashMLADecode:
 
             cur_pos = 0xFFFFFFFF  # -1 in unsigned, means use cur_pos_tensor
 
+            # Multicast sender: only core 0 (q1) reads from DRAM and multicasts to all others
+            is_mcast_sender = 1 if i == 0 else 0
+
             # Reader runtime args (simplified)
             reader_runtime_args = [
                 q_addr,
@@ -967,6 +1014,7 @@ class FlashMLADecode:
                 core_num_in_reduce,
                 core_num_in_output,
                 cur_pos,
+                is_mcast_sender,  # NEW: whether this core is the multicast sender
             ]
             reader_runtime_args.extend(output_core_physical_xs)
             reader_runtime_args.extend(output_core_physical_ys)
@@ -1003,7 +1051,7 @@ class FlashMLADecode:
         # Add runtime args for idle cores
         for core in core_group_idle:
             # Idle cores get zero/placeholder runtime args
-            idle_reader_runtime_args = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            idle_reader_runtime_args = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]  # Added is_mcast_sender=0
             idle_reader_runtime_args.extend([0] * len(output_core_physical_xs))
             idle_reader_runtime_args.extend([0] * len(output_core_physical_ys))
 

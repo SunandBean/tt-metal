@@ -15,6 +15,10 @@ FORCE_INLINE uint64_t get_shard_noc_addr_helper(const Accessor& reader, uint32_t
     return reader.get_shard_noc_addr(shard_id);
 }
 
+// Semaphore values for multicast synchronization
+constexpr uint32_t MCAST_INVALID = 0;
+constexpr uint32_t MCAST_VALID = 1;
+
 /******************************************************************************
  *                   Kernel Main                                               *
  ******************************************************************************/
@@ -43,9 +47,16 @@ void kernel_main() {
     constexpr uint32_t max_dynamic_chunk_size = get_compile_time_arg_val(16);
     constexpr bool tilize_q = get_compile_time_arg_val(17) == 1;
     constexpr uint32_t q_chunk_size_bytes = get_compile_time_arg_val(18);
+    // Multicast coordinates (physical NOC coords for S block bounding box)
+    constexpr uint32_t mcast_start_x = get_compile_time_arg_val(19);
+    constexpr uint32_t mcast_start_y = get_compile_time_arg_val(20);
+    constexpr uint32_t mcast_end_x = get_compile_time_arg_val(21);
+    constexpr uint32_t mcast_end_y = get_compile_time_arg_val(22);
+    constexpr uint32_t num_mcast_dests = get_compile_time_arg_val(23);
+    constexpr uint32_t mcast_semaphore_id = get_compile_time_arg_val(24);
 
     // TensorAccessorArgs for K and V (KV cache in DRAM), and pos tensor
-    constexpr auto k_args = TensorAccessorArgs<19>();
+    constexpr auto k_args = TensorAccessorArgs<25>();  // After multicast args
     constexpr auto v_args = TensorAccessorArgs<k_args.next_compile_time_args_offset()>();
     constexpr auto pos_args = TensorAccessorArgs<v_args.next_compile_time_args_offset()>();
 
@@ -61,6 +72,7 @@ void kernel_main() {
     const uint32_t core_num_in_reduce = get_arg_val<uint32_t>(arg_idx++);
     const uint32_t core_num_in_output = get_arg_val<uint32_t>(arg_idx++);
     const uint32_t cur_pos_arg = get_arg_val<uint32_t>(arg_idx++);
+    const bool is_mcast_sender = get_arg_val<uint32_t>(arg_idx++) == 1;
 
     // idle core
     if (q_addr == 0) {
@@ -153,11 +165,22 @@ void kernel_main() {
         }
     }
 
-    // Create KV cache reader
+    // Create KV cache reader (only used by mcast sender)
     const auto k_reader = TensorAccessor(k_args, k_addr, k_tile_bytes);
 
     // Number of chunks per batch = max_seq_len / k_chunk_size = St / Sk_chunk_t
     constexpr uint32_t num_chunks_per_batch = St / Sk_chunk_t;
+
+    // Set up multicast addresses and semaphore
+    const uint64_t mcast_noc_addr = get_noc_multicast_addr(mcast_start_x, mcast_start_y, mcast_end_x, mcast_end_y, 0);
+    const uint32_t mcast_semaphore_addr = get_semaphore(mcast_semaphore_id);
+    volatile tt_l1_ptr uint32_t* mcast_semaphore_ptr =
+        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(mcast_semaphore_addr);
+
+    // Sender: set local semaphore to valid once (will be multicast each iteration)
+    if (is_mcast_sender) {
+        noc_semaphore_set(mcast_semaphore_ptr, MCAST_VALID);
+    }
 
     for (uint32_t cur_head = cur_head_group * num_heads_per_core;
          cur_head < cur_head_group * num_heads_per_core + num_heads_per_core;
@@ -175,30 +198,49 @@ void kernel_main() {
                 uint32_t k_write_ptr = get_write_ptr(cb_k_in);
                 k_base_read_ptr = get_noc_addr(k_write_ptr);
 
-                if constexpr (k_args.is_sharded) {
-                    {
-                        DeviceZoneScopedN("issue-sharded-read");
-                        // ND SHARDED with ROUND_ROBIN_1D: each shard = one K chunk
-                        // Shard shape: [1, 1, k_chunk_size, kvpe_dim]
-                        // shard_id = batch * num_chunks_per_batch + chunk_id
+                const uint32_t k_chunk_bytes = k_chunk_tiles * k_tile_bytes;
+
+                if (is_mcast_sender) {
+                    // Sender: read from DRAM and multicast to all cores in S block
+                    if constexpr (k_args.is_sharded) {
+                        DeviceZoneScopedN("mcast-sender-sharded-read");
                         const uint32_t shard_id = kv_batch * num_chunks_per_batch + k_chunk;
-                        // Use helper to defer name lookup (get_shard_noc_addr doesn't exist on interleaved)
                         uint64_t k_src_noc_addr = get_shard_noc_addr_helper(k_reader, shard_id);
-                        noc_async_read(k_src_noc_addr, k_write_ptr, k_chunk_tiles * k_tile_bytes);
+                        noc_async_read(k_src_noc_addr, k_write_ptr, k_chunk_bytes);
+                    } else {
+                        DeviceZoneScopedN("mcast-sender-interleaved-read");
+                        const uint32_t k_batch_offset = kv_batch * num_kv_heads * St * DHt;
+                        const uint32_t k_head_offset = cur_head * St * DHt;
+                        const uint32_t k_chunk_offset = k_chunk * Sk_chunk_t_dynamic * DHt;
+                        uint32_t k_tile_id = k_batch_offset + k_head_offset + k_chunk_offset;
+                        uint32_t write_ptr = k_write_ptr;
+                        for (uint32_t tile = 0; tile < k_chunk_tiles; ++tile) {
+                            noc_async_read_tile(k_tile_id, k_reader, write_ptr);
+                            k_tile_id++;
+                            write_ptr += k_tile_bytes;
+                        }
+                    }
+                    noc_async_read_barrier();
+
+                    // Multicast K data to all other cores in the S block
+                    {
+                        DeviceZoneScopedN("mcast-sender-multicast");
+                        // Multicast to other cores (sender already has data from DRAM read, no loopback needed)
+                        uint64_t mcast_dest_addr = mcast_noc_addr | k_write_ptr;
+                        noc_async_write_multicast(k_write_ptr, mcast_dest_addr, k_chunk_bytes, num_mcast_dests, true);
+
+                        // Signal receivers that data is ready via multicast semaphore
+                        uint64_t mcast_sem_addr = mcast_noc_addr | mcast_semaphore_addr;
+                        noc_semaphore_set_multicast(mcast_semaphore_addr, mcast_sem_addr, num_mcast_dests);
+                        noc_async_write_barrier();
                     }
                 } else {
-                    // INTERLEAVED: read tile by tile
-                    const uint32_t k_batch_offset = kv_batch * num_kv_heads * St * DHt;
-                    const uint32_t k_head_offset = cur_head * St * DHt;
-                    const uint32_t k_chunk_offset = k_chunk * Sk_chunk_t_dynamic * DHt;
-                    uint32_t k_tile_id = k_batch_offset + k_head_offset + k_chunk_offset;
-                    for (uint32_t tile = 0; tile < k_chunk_tiles; ++tile) {
-                        noc_async_read_tile(k_tile_id, k_reader, k_write_ptr);
-                        k_tile_id++;
-                        k_write_ptr += k_tile_bytes;
-                    }
+                    // Receiver: wait for multicast data from sender
+                    DeviceZoneScopedN("mcast-receiver-wait");
+                    noc_semaphore_wait(mcast_semaphore_ptr, MCAST_VALID);
+                    noc_semaphore_set(mcast_semaphore_ptr, MCAST_INVALID);
                 }
-                noc_async_read_barrier();
+
                 cb_push_back(cb_k_in, k_chunk_tiles);
             }
 
