@@ -624,4 +624,4 @@ void kernel_main() {
             bias_block_offset += in1_block_w;
         }
     }  // for in1_num_blocks_w
-}  // MAIN
+}  // void kernel_main()

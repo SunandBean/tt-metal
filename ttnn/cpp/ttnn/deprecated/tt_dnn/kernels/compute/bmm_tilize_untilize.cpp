@@ -284,4 +284,4 @@ void kernel_main() {
 #endif
         }  // for in1_num_blocks_w
     }  // for in0_num_blocks_h
-}  // MAIN
+}  // void kernel_main()

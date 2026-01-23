@@ -100,4 +100,4 @@ void kernel_main() {
         reduce_h_fused<partial_iter_output_tiles, window_size_hw>(cb_id, scalar_cb_id, out_cb_id);
         cb_pop_front(scalar_cb_id, 1);
     }
-}  // MAIN
+}  // void kernel_main()

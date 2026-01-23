@@ -262,7 +262,7 @@ void kernel_main() {
 #endif
     }
     cb_pop_front(cb_mask_padded, 1);
-}  // MAIN
+}  // void kernel_main()
 
     // for scale+mask+softmax:
     // bcast HW (mul by 1 tile)  example: (  [2,1,1024,64] * [1,1,32,32]  )

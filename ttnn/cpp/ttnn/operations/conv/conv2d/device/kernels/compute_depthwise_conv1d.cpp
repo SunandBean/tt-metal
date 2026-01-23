@@ -155,4 +155,4 @@ void kernel_main() {
 
         }  // for in0_num_blocks_h
     }  // for in0_num_blocks_w
-}  // MAIN
+}  // void kernel_main()

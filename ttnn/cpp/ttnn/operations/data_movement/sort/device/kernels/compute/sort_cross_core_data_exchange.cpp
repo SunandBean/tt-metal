@@ -266,4 +266,4 @@ void kernel_main() {
         // Indexes tensor
         transpose_and_pack(index_tensor_transposed_cb_index, index_tensor_output_cb_index, number_of_tiles_per_core);
     }  // h loop
-}  // MAIN
+}  // void kernel_main()
