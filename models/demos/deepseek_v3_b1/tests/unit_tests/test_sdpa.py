@@ -25,13 +25,14 @@ from models.demos.deepseek_v3_b1.micro_ops.flash_mla.op import FlashMLADecode
 @pytest.mark.parametrize("batch_size", [1])
 @pytest.mark.parametrize("decode_position", [128 - 1])  # 2k, 4k, 8k, 32k
 @pytest.mark.parametrize("max_seq_len", [32 * 1024])  # 32k max sequence length per chip
-def test_flash_mla_decode(device, batch_size, decode_position, max_seq_len, use_python_op):
+@pytest.mark.parametrize("kv_sharded", [False, True], ids=["interleaved", "sharded"])
+def test_flash_mla_decode(device, batch_size, decode_position, max_seq_len, use_python_op, kv_sharded):
     """Test FlashMLADecode op with both Python and C++ implementations."""
     torch.manual_seed(0)
 
     # Use 128 heads and 16 heads per core to test 8 groups of heads
     # SDPA has bug with 8x32 tile size, so can't use 64 and 8 for now
-    num_heads = 128  # TP=2, so 128 / 2 = 64 heads per device
+    num_heads = 16  # TP=2, so 128 / 2 = 64 heads per device
     num_q_heads_per_core = 16
     kv_lora_rank = 512
     qk_nope_head_dim = 128
@@ -86,37 +87,37 @@ def test_flash_mla_decode(device, batch_size, decode_position, max_seq_len, use_
     )
 
     # Create KV cache (non-paged) based on max seq len
-    # Use ND sharding with ROUND_ROBIN_1D distribution across DRAM banks
-    # Each shard = one k_chunk (k_chunk_size x kvpe_dim), distributed round-robin
     logger.info(f"Creating KV cache with seq_len={max_seq_len}...")
     cache_shape = (batch_size, 1, max_seq_len, kvpe_dim)
     torch_cache = torch.randn(cache_shape, dtype=torch.bfloat16)
 
     # k_chunk_size for sharding - must match program_config.k_chunk_size (defined later)
     k_chunk_size = 128
-    dram_grid_size = device.dram_grid_size()
 
-    # ND shard spec with ROUND_ROBIN_1D distribution
-    # Shard shape: [1, 1, k_chunk_size, kvpe_dim] = one chunk per shard
-    # Total shards = batch_size * (max_seq_len / k_chunk_size)
-    # Shards are distributed round-robin across DRAM banks
-    kv_nd_shard_spec = ttnn.NdShardSpec(
-        shard_shape=[1, 1, k_chunk_size, kvpe_dim],
-        grid=ttnn.CoreRangeSet(
-            {ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(dram_grid_size.x - 1, dram_grid_size.y - 1))}
-        ),
-        orientation=ttnn.ShardOrientation.ROW_MAJOR,
-        shard_distribution_strategy=ttnn.ShardDistributionStrategy.ROUND_ROBIN_1D,
-    )
-    kv_mem_config = ttnn.MemoryConfig(
-        buffer_type=ttnn.BufferType.DRAM,
-        nd_shard_spec=kv_nd_shard_spec,
-    )
-
-    num_chunks = max_seq_len // k_chunk_size
-    logger.info(
-        f"DRAM banks: {dram_grid_size.x * dram_grid_size.y}, chunks: {num_chunks}, shard_shape: [{batch_size}, 1, {k_chunk_size}, {kvpe_dim}]"
-    )
+    if kv_sharded:
+        # ND sharding with ROUND_ROBIN_1D distribution across DRAM banks
+        # Each shard = one k_chunk (k_chunk_size x kvpe_dim), distributed round-robin
+        dram_grid_size = device.dram_grid_size()
+        kv_nd_shard_spec = ttnn.NdShardSpec(
+            shard_shape=[1, 1, k_chunk_size, kvpe_dim],
+            grid=ttnn.CoreRangeSet(
+                {ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(dram_grid_size.x - 1, dram_grid_size.y - 1))}
+            ),
+            orientation=ttnn.ShardOrientation.ROW_MAJOR,
+            shard_distribution_strategy=ttnn.ShardDistributionStrategy.ROUND_ROBIN_1D,
+        )
+        kv_mem_config = ttnn.MemoryConfig(
+            buffer_type=ttnn.BufferType.DRAM,
+            nd_shard_spec=kv_nd_shard_spec,
+        )
+        num_chunks = max_seq_len // k_chunk_size
+        logger.info(
+            f"KV cache: ND sharded, DRAM banks: {dram_grid_size.x * dram_grid_size.y}, chunks: {num_chunks}, shard_shape: [1, 1, {k_chunk_size}, {kvpe_dim}]"
+        )
+    else:
+        # Interleaved DRAM
+        kv_mem_config = ttnn.DRAM_MEMORY_CONFIG
+        logger.info("KV cache: interleaved DRAM")
 
     tt_cache = ttnn.from_torch(
         torch_cache,

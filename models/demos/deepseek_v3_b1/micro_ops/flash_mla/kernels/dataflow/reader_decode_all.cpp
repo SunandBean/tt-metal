@@ -8,6 +8,13 @@
 
 #include "../rt_args_common.hpp"
 
+// Helper template to get shard noc address - uses type-dependent expression
+// to defer name lookup until instantiation (avoids compile error on interleaved)
+template <typename Accessor>
+FORCE_INLINE uint64_t get_shard_noc_addr_helper(const Accessor& reader, uint32_t shard_id) {
+    return reader.get_shard_noc_addr(shard_id);
+}
+
 /******************************************************************************
  *                   Kernel Main                                               *
  ******************************************************************************/
@@ -175,7 +182,8 @@ void kernel_main() {
                         // Shard shape: [1, 1, k_chunk_size, kvpe_dim]
                         // shard_id = batch * num_chunks_per_batch + chunk_id
                         const uint32_t shard_id = kv_batch * num_chunks_per_batch + k_chunk;
-                        uint64_t k_src_noc_addr = k_reader.get_shard_noc_addr(shard_id);
+                        // Use helper to defer name lookup (get_shard_noc_addr doesn't exist on interleaved)
+                        uint64_t k_src_noc_addr = get_shard_noc_addr_helper(k_reader, shard_id);
                         noc_async_read(k_src_noc_addr, k_write_ptr, k_chunk_tiles * k_tile_bytes);
                     }
                 } else {
