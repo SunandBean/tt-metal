@@ -37,6 +37,128 @@ def float_to_uint32(val: float) -> int:
     return struct.unpack("I", struct.pack("f", val))[0]
 
 
+# =============================================================================
+# Hard-coded S block definitions for SDPA compute grid
+# Each S block has up to 8 cores for sequence length parallelism
+# Q heads are sharded across the first core of each batch (output core)
+# =============================================================================
+# S blocks layout (from diagram):
+# - S1, S2, S3, S4: Left side (Knope/RMS region)
+# - S5, S6, S7, S8: Right side (Kpe/Rope region)
+# Each S block: 8 cores arranged for seq len parallelism per Q head group
+
+# S1 block: columns 0-3, rows 1-2 (upper left region, 0-indexed)
+S1_CORES = [
+    (0, 1),
+    (1, 1),
+    (2, 1),
+    (3, 1),  # Row 1: first 4 cores (Q1, Q2 output cores here)
+    (0, 2),
+    (1, 2),
+    (2, 2),
+    (3, 2),  # Row 2: next 4 cores
+]
+
+# S2 block: columns 0-3, rows 3-4 (0-indexed)
+S2_CORES = [
+    (0, 3),
+    (1, 3),
+    (2, 3),
+    (3, 3),  # Row 3
+    (0, 4),
+    (1, 4),
+    (2, 4),
+    (3, 4),  # Row 4
+]
+
+# S3 block: columns 0-3, rows 7-8 (0-indexed)
+S3_CORES = [
+    (0, 7),
+    (1, 7),
+    (2, 7),
+    (3, 7),  # Row 7
+    (0, 8),
+    (1, 8),
+    (2, 8),
+    (3, 8),  # Row 8
+]
+
+# S4 block: split top/bottom (wraps around, 0-indexed)
+S4_CORES = [
+    (0, 9),
+    (1, 9),
+    (2, 9),
+    (3, 9),  # Row 9
+    (0, 0),
+    (1, 0),
+    (2, 0),
+    (3, 0),  # Row 0 (wraps to top, "S4 bot" in diagram)
+]
+
+# S5 block: columns 7-10, rows 1-2 (right side, 0-indexed)
+S5_CORES = [
+    (7, 1),
+    (8, 1),
+    (9, 1),
+    (10, 1),  # Row 1
+    (7, 2),
+    (8, 2),
+    (9, 2),
+    (10, 2),  # Row 2
+]
+
+# S6 block: columns 7-10, rows 4-5 (0-indexed)
+S6_CORES = [
+    (7, 4),
+    (8, 4),
+    (9, 4),
+    (10, 4),  # Row 4
+    (7, 5),
+    (8, 5),
+    (9, 5),
+    (10, 5),  # Row 5
+]
+
+# S7 block: columns 7-10, rows 6-7 (0-indexed)
+S7_CORES = [
+    (7, 6),
+    (8, 6),
+    (9, 6),
+    (10, 6),  # Row 6
+    (7, 7),
+    (8, 7),
+    (9, 7),
+    (10, 7),  # Row 7
+]
+
+# S8 block: columns 7-10, split top/bottom (wraps around, 0-indexed)
+S8_CORES = [
+    (7, 9),
+    (8, 9),
+    (9, 9),
+    (10, 9),  # Row 9
+    (7, 0),
+    (8, 0),
+    (9, 0),
+    (10, 0),  # Row 0 (wraps to top, "S8 bot" in diagram)
+]
+
+# All S blocks for iteration
+S_BLOCKS = [S1_CORES, S2_CORES, S3_CORES, S4_CORES, S5_CORES, S6_CORES, S7_CORES, S8_CORES]
+
+
+def get_s_block_core_range_set(s_block_idx: int) -> "ttnn.CoreRangeSet":
+    """Get CoreRangeSet for a specific S block (0-indexed)."""
+    cores = S_BLOCKS[s_block_idx]
+    return ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(x, y), ttnn.CoreCoord(x, y)) for x, y in cores])
+
+
+def get_s_block_output_cores(s_block_idx: int, num_output_cores: int) -> list:
+    """Get the first N cores from an S block (these are the output/Q shard cores)."""
+    cores = S_BLOCKS[s_block_idx]
+    return cores[:num_output_cores]
+
+
 def get_interleaved_tensor_accessor_args(tensor):
     """
     Construct tensor accessor compile-time args for interleaved tensors (DRAM or L1).
@@ -225,51 +347,69 @@ class FlashMLADecode:
         Sk_chunk_t = k_chunk_size // K_TILE_HEIGHT  # K chunks use K tile height
 
         # =========================================================================
-        # Parallelization scheme (matching C++ lines 163-282)
+        # Parallelization scheme - Hard-coded S block layout
         # =========================================================================
-        num_cores_available = grid_size.x * grid_size.y
+        # Use S1 block for SDPA computation (hard-coded for now)
+        # S1 has 8 cores: first B cores are output cores (hold Q shards), rest are workers
+        s_block_idx = 0  # Use S1 for now
+        s_block_cores = S_BLOCKS[s_block_idx]
 
-        # Core grid setup
-        core_grid = ttnn.CoreRangeSet(
-            [ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(grid_size.x - 1, grid_size.y - 1))]
-        )
+        # Validate S block has enough cores for the Q shards
+        assert B <= len(
+            s_block_cores
+        ), f"S block {s_block_idx + 1} has {len(s_block_cores)} cores but need {B} output cores for Q shards"
 
-        # Balance cores (C++ lines 197-207)
-        # C++ default for max_cores_per_head_batch is 16
-        max_cores_per_head_batch = 16  # Default value matching C++
-        if program_config is not None and hasattr(program_config, "max_cores_per_head_batch"):
-            max_cores_per_head_batch = program_config.max_cores_per_head_batch
-        max_num_cores_for_compute = (
-            max_cores_per_head_batch * B * num_kv_heads if program_config is not None else num_cores_available
-        )
-        num_cores_per_batch = min(num_cores_available, max_num_cores_for_compute) // B
-        num_cores_per_head = max(1, num_cores_per_batch // num_kv_heads)
+        # Validate Q tensor is sharded on the correct S block output cores
+        q_shard_grid = input_tensor_q.memory_config().shard_spec.grid
+        expected_q_cores = get_s_block_output_cores(s_block_idx, B)
+        for i, (expected_x, expected_y) in enumerate(expected_q_cores):
+            # Find the i-th core in the Q shard grid
+            found = False
+            for core_range in q_shard_grid.ranges():
+                # CoreRange uses .start and .end (CoreCoord objects)
+                for x in range(core_range.start.x, core_range.end.x + 1):
+                    for y in range(core_range.start.y, core_range.end.y + 1):
+                        if x == expected_x and y == expected_y:
+                            found = True
+                            break
+            assert found, (
+                f"Q tensor must be sharded on S{s_block_idx + 1} output cores. "
+                f"Expected core ({expected_x}, {expected_y}) not found in Q shard grid."
+            )
+
+        # Calculate parallelization parameters based on S block layout
+        num_cores_in_s_block = len(s_block_cores)
+        num_output_cores = B  # Number of Q shards = number of output cores
+        num_cores_per_batch = num_cores_in_s_block // B  # Cores per Q shard for seq len parallelism
+        num_cores_per_head = num_cores_per_batch // num_kv_heads  # Cores per KV head
         num_heads_per_core = max(1, math.ceil(num_kv_heads / num_cores_per_batch))
         num_reducer_cores = num_kv_heads * B // num_heads_per_core
-        num_output_cores = B
-        num_active_cores = num_cores_per_head * num_kv_heads * B // num_heads_per_core
-        # Recalculate num_cores_per_batch based on num_active_cores
-        num_cores_per_batch = num_active_cores // B
+        num_active_cores = num_cores_in_s_block
 
-        # Create core group (Q and output are always sharded)
+        # Build core grid from S block
+        core_grid = ttnn.CoreRangeSet(
+            [ttnn.CoreRange(ttnn.CoreCoord(x, y), ttnn.CoreCoord(x, y)) for x, y in s_block_cores]
+        )
+
+        # Create core group from S block cores
+        # Layout: output cores first (hold Q shards), then worker cores for seq len parallelism
         core_group = []
         core_group_idle = []
 
-        reducer_idx = 0
-        worker_idx = num_output_cores
+        # Interleave output cores and workers: for each batch, output core first, then workers
+        for batch_idx in range(B):
+            # Output core for this batch (first core in each batch's allocation)
+            output_core_idx = batch_idx * num_cores_per_batch
+            if output_core_idx < len(s_block_cores):
+                x, y = s_block_cores[output_core_idx]
+                core_group.append(ttnn.CoreCoord(x, y))
 
-        for i in range(num_cores_available):
-            if i % num_cores_per_batch == 0 and reducer_idx < num_output_cores:
-                core = ttnn.CoreCoord(reducer_idx % grid_size.x, reducer_idx // grid_size.x)
-                reducer_idx += 1
-            else:
-                core = ttnn.CoreCoord(worker_idx % grid_size.x, worker_idx // grid_size.x)
-                worker_idx += 1
-
-            if i < num_active_cores:
-                core_group.append(core)
-            else:
-                core_group_idle.append(core)
+            # Worker cores for this batch
+            for worker_offset in range(1, num_cores_per_batch):
+                worker_core_idx = batch_idx * num_cores_per_batch + worker_offset
+                if worker_core_idx < len(s_block_cores):
+                    x, y = s_block_cores[worker_core_idx]
+                    core_group.append(ttnn.CoreCoord(x, y))
 
         # =========================================================================
         # CB tile counts (matching C++ lines 285-299)

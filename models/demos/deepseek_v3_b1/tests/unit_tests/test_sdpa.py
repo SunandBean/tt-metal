@@ -24,6 +24,7 @@ from models.demos.deepseek_v3_b1.micro_ops.flash_mla.op import FlashMLADecode
 @pytest.mark.parametrize("use_python_op", [True], ids=["python"])
 @pytest.mark.parametrize("batch_size", [1])
 @pytest.mark.parametrize("decode_position", [128 - 1, 2 * 1024 - 1, 4 * 1024 - 1, 8 * 1024 - 1, 32 * 1024 - 1])
+# @pytest.mark.parametrize("decode_position", [128 - 1])
 @pytest.mark.parametrize("max_seq_len", [32 * 1024])  # 32k max sequence length per chip
 @pytest.mark.parametrize("kv_sharded", [False, True], ids=["interleaved", "sharded"])
 def test_flash_mla_decode(device, batch_size, decode_position, max_seq_len, use_python_op, kv_sharded):
@@ -46,19 +47,23 @@ def test_flash_mla_decode(device, batch_size, decode_position, max_seq_len, use_
     )
 
     # Create sharded memory configs for Q and output
-    # 8 Q heads per core, 8 cores total (can be disjoint)
+    # Q heads sharded onto S1 block output cores (from op.py S1_CORES definition)
+    # S1_CORES = [(1,2), (2,2), (3,2), (4,2), (1,3), (2,3), (3,3), (4,3)]
+    # With 8 Q shards (128 heads / 16 per core = 8), each Q shard uses 1 core from S1
     tiny_tile = ttnn.Tile((num_q_heads_per_core, 32))
     compute_grid = ttnn.CoreCoord(8, 8)  # SDPAProgramConfig requires CoreCoord, not CoreGrid
+
+    # Q cores must match S1 output cores - 8 cores for 8 Q shards (0-indexed)
     q_core_grid = ttnn.CoreRangeSet(
         [
-            ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0)),
-            ttnn.CoreRange(ttnn.CoreCoord(1, 0), ttnn.CoreCoord(1, 0)),
-            ttnn.CoreRange(ttnn.CoreCoord(2, 0), ttnn.CoreCoord(2, 0)),
-            ttnn.CoreRange(ttnn.CoreCoord(3, 0), ttnn.CoreCoord(3, 0)),
-            ttnn.CoreRange(ttnn.CoreCoord(4, 0), ttnn.CoreCoord(4, 0)),
-            ttnn.CoreRange(ttnn.CoreCoord(5, 0), ttnn.CoreCoord(5, 0)),
-            ttnn.CoreRange(ttnn.CoreCoord(6, 0), ttnn.CoreCoord(6, 0)),
-            ttnn.CoreRange(ttnn.CoreCoord(7, 0), ttnn.CoreCoord(7, 0)),
+            ttnn.CoreRange(ttnn.CoreCoord(0, 1), ttnn.CoreCoord(0, 1)),  # S1 core 0
+            ttnn.CoreRange(ttnn.CoreCoord(1, 1), ttnn.CoreCoord(1, 1)),  # S1 core 1
+            ttnn.CoreRange(ttnn.CoreCoord(2, 1), ttnn.CoreCoord(2, 1)),  # S1 core 2
+            ttnn.CoreRange(ttnn.CoreCoord(3, 1), ttnn.CoreCoord(3, 1)),  # S1 core 3
+            ttnn.CoreRange(ttnn.CoreCoord(0, 2), ttnn.CoreCoord(0, 2)),  # S1 core 4
+            ttnn.CoreRange(ttnn.CoreCoord(1, 2), ttnn.CoreCoord(1, 2)),  # S1 core 5
+            ttnn.CoreRange(ttnn.CoreCoord(2, 2), ttnn.CoreCoord(2, 2)),  # S1 core 6
+            ttnn.CoreRange(ttnn.CoreCoord(3, 2), ttnn.CoreCoord(3, 2)),  # S1 core 7
         ]
     )
     q_mem_config = ttnn.MemoryConfig(
