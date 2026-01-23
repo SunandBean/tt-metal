@@ -490,12 +490,7 @@ jobs:
   push-latest:
     # Push images based on the dynamic matrix calculated by calculate-to-publish
     # This job will only run if calculate-to-publish has images to push
-    if: >-
-      ${{
-        !cancelled() &&
-        needs.calculate-to-publish.result == 'success' &&
-        needs.calculate-to-publish.outputs.images-to-push != '[]'
-      }}
+    if: ${{ false }}
     needs:
       - calculate-to-publish
     permissions:
