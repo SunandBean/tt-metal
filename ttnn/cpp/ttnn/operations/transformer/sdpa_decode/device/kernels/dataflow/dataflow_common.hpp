@@ -413,9 +413,12 @@ void worker_compute(
     uint32_t out_tile_id = 0;
 
     // Wait for compute to deliver output chunk
-    cb_wait_front(cb_out, out_chunk_tiles);
-    cb_wait_front(cb_out_m, PNHt);
-    cb_wait_front(cb_out_l, PNHt);
+    {
+        DeviceZoneScopedN("wait on local cb writeout");
+        cb_wait_front(cb_out, out_chunk_tiles);
+        cb_wait_front(cb_out_m, PNHt);
+        cb_wait_front(cb_out_l, PNHt);
+    }
 
     // Write output chunk to reducer
     constexpr uint32_t tile_bytes = get_tile_size(cb_out);
@@ -426,15 +429,20 @@ void worker_compute(
         get_noc_addr(reduce_core_noc_x, reduce_core_noc_y, get_write_ptr(cb_intermed_out)) + worker_offset;
 
     // send the max logits first then the logits sum then the partial output to the reducer
-    noc_async_write(get_read_ptr(cb_out_m), output_write_addr, ml_write_size);
-    output_write_addr += ml_write_size;
-    noc_async_write(get_read_ptr(cb_out_l), output_write_addr, ml_write_size);
-    output_write_addr += ml_write_size;
-    noc_async_write(get_read_ptr(cb_out), output_write_addr, o_write_size);
-
+    {
+        DeviceZoneScopedN("write output chunk to reducer");
+        noc_async_write(get_read_ptr(cb_out_m), output_write_addr, ml_write_size);
+        output_write_addr += ml_write_size;
+        noc_async_write(get_read_ptr(cb_out_l), output_write_addr, ml_write_size);
+        output_write_addr += ml_write_size;
+        noc_async_write(get_read_ptr(cb_out), output_write_addr, o_write_size);
+    }
     // increment semaphore
-    noc_async_write_barrier();
-    noc_semaphore_inc(in0_sender_semaphore_noc_addr, 1);
+    {
+        DeviceZoneScopedN("barrier + incr sem");
+        noc_async_write_barrier();
+        noc_semaphore_inc(in0_sender_semaphore_noc_addr, 1);
+    }
 
     // pop front
     cb_pop_front(cb_out, out_chunk_tiles);

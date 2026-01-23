@@ -254,24 +254,32 @@ SdpaDecodeProgramFactory::cached_program_t SdpaDecodeProgramFactory::create(
         }
     } else {
         if (is_q_sharded || is_output_sharded) {
-            int reducer_idx = 0;
-            int worker_idx = num_output_cores;
-
             for (int i = 0; i < num_cores_available; ++i) {
-                CoreCoord core;
-                if (i % num_cores_per_batch == 0 && reducer_idx < num_output_cores) {
-                    core = {reducer_idx % grid_size.x, reducer_idx / grid_size.x};
-                    reducer_idx++;
-                } else {
-                    core = {worker_idx % grid_size.x, worker_idx / grid_size.x};
-                    worker_idx++;
-                }
+                CoreCoord core = {i % grid_size.x, i / grid_size.x};
                 if (i < num_active_cores) {
                     core_group.push_back(core);
                 } else {
                     core_group_idle.push_back(core);
                 }
             }
+            // int reducer_idx = 0;
+            // int worker_idx = num_output_cores; // 16
+
+            // for (int i = 0; i < num_cores_available; ++i) {
+            //     CoreCoord core;
+            //     if (i % num_cores_per_batch == 0 && reducer_idx < num_output_cores) {
+            //         core = {reducer_idx % grid_size.x, reducer_idx / grid_size.x};
+            //         reducer_idx++;
+            //     } else {
+            //         core = {worker_idx % grid_size.x, worker_idx / grid_size.x};
+            //         worker_idx++;
+            //     }
+            //     if (i < num_active_cores) {
+            //         core_group.push_back(core);
+            //     } else {
+            //         core_group_idle.push_back(core);
+            //     }
+            // }
         } else {
             for (int i = 0; i < num_cores_available; ++i) {
                 CoreCoord core = {i % grid_size.x, i / grid_size.x};

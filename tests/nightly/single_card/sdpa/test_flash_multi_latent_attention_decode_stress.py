@@ -43,27 +43,14 @@ def create_replicated_q_shard_spec(device, batch, nh, d, num_cores_per_head=4):
     # Build core list in the exact SDPA order (matching program factory)
     core_list = []
 
-    # Output cores are at the first num_output_cores logical positions
-    output_cores = [(i % grid_x, i // grid_x) for i in range(num_output_cores)]
-    worker_start = num_output_cores
-
-    print(f"output_cores: {output_cores}")
-    print(f"worker_start: {worker_start}")
-
-    for vbatch in range(num_virtual_batches):  # 16 virtual batches
-        # Output core (reducer) for this virtual batch
-        core_list.append(output_cores[vbatch])
-        # Worker cores (num_cores_per_head - 1 workers per virtual batch)
-        for w in range(1, num_cores_per_head):
-            worker_idx = worker_start + (vbatch * (num_cores_per_head - 1)) + (w - 1)
-            core_list.append((worker_idx % grid_x, worker_idx // grid_x))
+    for i in range(total_cores):
+        core_list.append((i % grid_x, i // grid_x))
 
     print(f"core_list: {core_list}")
     # Create core range set from the list
     core_range_set = ttnn.CoreRangeSet(
         [ttnn.CoreRange(ttnn.CoreCoord(x, y), ttnn.CoreCoord(x, y)) for x, y in core_list]
     )
-    breakpoint()
     return ttnn.create_sharded_memory_config(
         shape=(shard_height, shard_width),
         core_grid=core_range_set,

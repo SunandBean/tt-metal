@@ -189,16 +189,22 @@ void kernel_main() {
             // reducer's compute Wait for compute to deliver output chunk, and write to compute again for reduction data
             // in cb_intermed_out is arranged as [o,m,l,o,m,l,...] with size (out_chunk_tiles +
             // 2*PNHt)*num_cores_to_wait wait on in0 semaphore value to become VALID (set by sender)
-            {
-                DeviceZoneScopedN("wait on in0 semaphore");
-                noc_semaphore_wait(in0_receiver_semaphore_addr_ptr, num_cores_to_wait);
-                // noc_semaphore_set(in0_receiver_semaphore_addr_ptr, 0);
+            // {
+            //     DeviceZoneScopedN("wait on in0 semaphore");
+            //     // noc_semaphore_wait(in0_receiver_semaphore_addr_ptr, num_cores_to_wait);
+            //     // noc_semaphore_set(in0_receiver_semaphore_addr_ptr, 0);
 
-                // cb_wait_front(cb_intermed_out, num_tiles_to_wait);
-            }
+            //     // cb_wait_front(cb_intermed_out, num_tiles_to_wait);
+            // }
             constexpr uint32_t q_read_size = out_chunk_tiles * tile_bytes_intermed;
             constexpr uint32_t ml_read_size = PNHt * tile_bytes_intermed;
             for (uint32_t block = 0; block < num_cores_to_wait; ++block) {
+                {
+                    DeviceZoneScopedN("wait on in0 semaphore");
+                    noc_semaphore_wait_min(in0_receiver_semaphore_addr_ptr, 1);
+                    // *in0_receiver_semaphore_addr_ptr -= 1;
+                    // noc_semaphore_set(in0_receiver_semaphore_addr_ptr, 0);
+                }
                 {
                     DeviceZoneScopedN("write collect stats");
                     cb_reserve_back(cb_out_o, out_chunk_tiles);
