@@ -289,7 +289,7 @@ jobs:
             image-name: ${{ needs.get-image-tags.outputs.bh-p300-image-tag }}
     runs-on:
       - ${{ matrix.bh-config.runner-label }}
-      - in-service
+      - ${{ matrix.bh-config.runner-label == 'BH-LoudBox' && 'f01cs02' || 'in-service' }}
     steps:
       - name: Download Llama model weights from LFC
         timeout-minutes: 15
