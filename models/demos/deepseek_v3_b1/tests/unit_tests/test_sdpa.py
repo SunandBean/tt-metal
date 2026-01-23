@@ -86,16 +86,44 @@ def test_flash_mla_decode(device, batch_size, decode_position, max_seq_len, use_
     )
 
     # Create KV cache (non-paged) based on max seq len
+    # Use ND sharding with ROUND_ROBIN_1D distribution across DRAM banks
+    # Each shard = one k_chunk (k_chunk_size x kvpe_dim), distributed round-robin
     logger.info(f"Creating KV cache with seq_len={max_seq_len}...")
     cache_shape = (batch_size, 1, max_seq_len, kvpe_dim)
     torch_cache = torch.randn(cache_shape, dtype=torch.bfloat16)
+
+    # k_chunk_size for sharding - must match program_config.k_chunk_size (defined later)
+    k_chunk_size = 128
+    dram_grid_size = device.dram_grid_size()
+
+    # ND shard spec with ROUND_ROBIN_1D distribution
+    # Shard shape: [1, 1, k_chunk_size, kvpe_dim] = one chunk per shard
+    # Total shards = batch_size * (max_seq_len / k_chunk_size)
+    # Shards are distributed round-robin across DRAM banks
+    kv_nd_shard_spec = ttnn.NdShardSpec(
+        shard_shape=[1, 1, k_chunk_size, kvpe_dim],
+        grid=ttnn.CoreRangeSet(
+            {ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(dram_grid_size.x - 1, dram_grid_size.y - 1))}
+        ),
+        orientation=ttnn.ShardOrientation.ROW_MAJOR,
+        shard_distribution_strategy=ttnn.ShardDistributionStrategy.ROUND_ROBIN_1D,
+    )
+    kv_mem_config = ttnn.MemoryConfig(
+        buffer_type=ttnn.BufferType.DRAM,
+        nd_shard_spec=kv_nd_shard_spec,
+    )
+
+    num_chunks = max_seq_len // k_chunk_size
+    logger.info(
+        f"DRAM banks: {dram_grid_size.x * dram_grid_size.y}, chunks: {num_chunks}, shard_shape: [{batch_size}, 1, {k_chunk_size}, {kvpe_dim}]"
+    )
 
     tt_cache = ttnn.from_torch(
         torch_cache,
         dtype=ttnn.bfloat8_b,
         layout=ttnn.TILE_LAYOUT,
         device=device,
-        memory_config=ttnn.DRAM_MEMORY_CONFIG,
+        memory_config=kv_mem_config,
     )
 
     # Create position tensor

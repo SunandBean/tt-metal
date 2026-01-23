@@ -14,7 +14,8 @@
 void kernel_main() {
     /*
     Simplified Flash MLA Decode reader kernel.
-    Q is always sharded, KV cache is always in DRAM interleaved.
+    Q is always sharded, KV cache can be DRAM interleaved or HEIGHT_SHARDED.
+    For HEIGHT_SHARDED KV cache, each shard = one K chunk (k_chunk_size x kvpe_dim).
     */
     constexpr uint32_t B = get_compile_time_arg_val(0);           // batch size
     constexpr uint32_t PNHt = get_compile_time_arg_val(1);        // padded number of heads in tiles
@@ -145,19 +146,17 @@ void kernel_main() {
         }
     }
 
-    // Create KV cache reader (DRAM interleaved)
+    // Create KV cache reader
     const auto k_reader = TensorAccessor(k_args, k_addr, k_tile_bytes);
+
+    // Number of chunks per batch = max_seq_len / k_chunk_size = St / Sk_chunk_t
+    constexpr uint32_t num_chunks_per_batch = St / Sk_chunk_t;
 
     for (uint32_t cur_head = cur_head_group * num_heads_per_core;
          cur_head < cur_head_group * num_heads_per_core + num_heads_per_core;
          ++cur_head) {
-        // Offset for current batch (non-paged attention)
-        const uint32_t k_batch_offset = ((cur_batch / q_heads_parallel_factor) % Bkv) * num_kv_heads * St * DHt;
-        const uint32_t k_head_offset = cur_head * St * DHt;
-
-        // Read K, V chunks
-        const uint32_t k_chunk_offset = k_chunk_start * Sk_chunk_t_dynamic * DHt;
-        uint32_t k_start_tile_id = k_batch_offset + k_head_offset + k_chunk_offset;
+        // Batch index for KV cache
+        const uint32_t kv_batch = (cur_batch / q_heads_parallel_factor) % Bkv;
 
         for (uint32_t k_chunk = k_chunk_start; k_chunk < k_chunk_end; ++k_chunk) {
             // Read K chunk in natural [Sk_chunk, DHt] order (no transpose)
@@ -168,11 +167,28 @@ void kernel_main() {
                 cb_reserve_back(cb_k_in, k_chunk_tiles);
                 uint32_t k_write_ptr = get_write_ptr(cb_k_in);
                 k_base_read_ptr = get_noc_addr(k_write_ptr);
-                uint32_t k_tile_id = k_start_tile_id;
-                for (uint32_t tile = 0; tile < k_chunk_tiles; ++tile) {
-                    noc_async_read_tile(k_tile_id, k_reader, k_write_ptr);
-                    k_tile_id++;
-                    k_write_ptr += k_tile_bytes;
+
+                if constexpr (k_args.is_sharded) {
+                    {
+                        DeviceZoneScopedN("issue-sharded-read");
+                        // ND SHARDED with ROUND_ROBIN_1D: each shard = one K chunk
+                        // Shard shape: [1, 1, k_chunk_size, kvpe_dim]
+                        // shard_id = batch * num_chunks_per_batch + chunk_id
+                        const uint32_t shard_id = kv_batch * num_chunks_per_batch + k_chunk;
+                        uint64_t k_src_noc_addr = k_reader.get_shard_noc_addr(shard_id);
+                        noc_async_read(k_src_noc_addr, k_write_ptr, k_chunk_tiles * k_tile_bytes);
+                    }
+                } else {
+                    // INTERLEAVED: read tile by tile
+                    const uint32_t k_batch_offset = kv_batch * num_kv_heads * St * DHt;
+                    const uint32_t k_head_offset = cur_head * St * DHt;
+                    const uint32_t k_chunk_offset = k_chunk * Sk_chunk_t_dynamic * DHt;
+                    uint32_t k_tile_id = k_batch_offset + k_head_offset + k_chunk_offset;
+                    for (uint32_t tile = 0; tile < k_chunk_tiles; ++tile) {
+                        noc_async_read_tile(k_tile_id, k_reader, k_write_ptr);
+                        k_tile_id++;
+                        k_write_ptr += k_tile_bytes;
+                    }
                 }
                 noc_async_read_barrier();
                 cb_push_back(cb_k_in, k_chunk_tiles);
@@ -195,9 +211,6 @@ void kernel_main() {
                 noc_async_read_barrier();
                 cb_push_back(cb_v_in, v_chunk_tiles);
             }
-
-            // Update the starting tile id for next iteration
-            k_start_tile_id += k_chunk_tiles;
         }
     }
 }

@@ -47,6 +47,17 @@ def get_interleaved_tensor_accessor_args(tensor):
     return [2 if is_dram else 0]
 
 
+def get_tensor_accessor_args(tensor):
+    """
+    Construct tensor accessor compile-time args for any tensor (interleaved or sharded).
+
+    Uses ttnn.TensorAccessorArgs to get proper args for the tensor's memory config.
+    Returns list of compile-time args.
+    """
+    accessor_args = ttnn.TensorAccessorArgs(tensor)
+    return accessor_args.get_compile_time_args()
+
+
 class FlashMLADecode:
     """
     Flash Multi-Latent Attention Decode.
@@ -441,12 +452,12 @@ class FlashMLADecode:
             1 if tilize_q else 0,  # 17
             q_chunk_size_bytes,  # 18
         ]
-        # TensorAccessorArgs for K, V (KV cache in DRAM), and pos tensor
-        reader_compile_time_args.extend(get_interleaved_tensor_accessor_args(kv_cache_tensor))  # K
-        reader_compile_time_args.extend(get_interleaved_tensor_accessor_args(kv_cache_tensor))  # V (same as K for MLA)
+        # TensorAccessorArgs for K, V (KV cache - can be interleaved or height-sharded), and pos tensor
+        reader_compile_time_args.extend(get_tensor_accessor_args(kv_cache_tensor))  # K
+        reader_compile_time_args.extend(get_tensor_accessor_args(kv_cache_tensor))  # V (same as K for MLA)
         reader_compile_time_args.extend(
             get_interleaved_tensor_accessor_args(cur_pos_tensor)
-        )  # pos (also DRAM interleaved)
+        )  # pos (always DRAM interleaved)
 
         # Writer compile time args (simplified for sharded output, num_kv_heads=1)
         writer_compile_time_args = [
@@ -884,23 +895,29 @@ class FlashMLADecode:
 
         # Create 3 kernel descriptors covering ALL cores (not per-core)
         kernel_descriptors = [
-            # Reader kernel
+            # Reader kernel (use NOC_0 explicitly for DRAM reads)
             ttnn.KernelDescriptor(
                 kernel_source="models/demos/deepseek_v3_b1/micro_ops/flash_mla/kernels/dataflow/reader_decode_all.cpp",
                 source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
                 core_ranges=core_grid,
                 compile_time_args=reader_compile_time_args,
                 runtime_args=reader_rtargs,
-                config=ttnn.ReaderConfigDescriptor(),
+                config=ttnn.DataMovementConfigDescriptor(
+                    processor=ttnn.DataMovementProcessor.RISCV_0,
+                    noc=ttnn.NOC.NOC_0,
+                ),
             ),
-            # Writer kernel
+            # Writer kernel (use NOC_1 to avoid conflict with reader on NOC_0)
             ttnn.KernelDescriptor(
                 kernel_source="models/demos/deepseek_v3_b1/micro_ops/flash_mla/kernels/dataflow/writer_decode_all.cpp",
                 source_type=ttnn.KernelDescriptor.SourceType.FILE_PATH,
                 core_ranges=core_grid,
                 compile_time_args=writer_compile_time_args,
                 runtime_args=writer_rtargs,
-                config=ttnn.WriterConfigDescriptor(),
+                config=ttnn.DataMovementConfigDescriptor(
+                    processor=ttnn.DataMovementProcessor.RISCV_1,
+                    noc=ttnn.NOC.NOC_1,
+                ),
             ),
             # Compute kernel
             ttnn.KernelDescriptor(
