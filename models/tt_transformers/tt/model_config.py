@@ -1820,8 +1820,7 @@ class ModelArgs:
                 self.hf_config = AutoConfig.from_pretrained(
                     self.CKPT_DIR,
                     trust_remote_code=self.trust_remote_code_hf,
-                    local_files_only=os.getenv("CI")
-                    == "true",  # TODO: remove this once we have a local copy of Qwen3-VL-32B-Instruct in CI,
+                    local_files_only=os.getenv("CI") == "true",
                 )
 
             config = self.hf_config.to_dict()
