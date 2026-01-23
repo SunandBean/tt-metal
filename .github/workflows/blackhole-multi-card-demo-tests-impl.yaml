@@ -99,7 +99,7 @@ jobs:
         with:
           build-artifact-name: ${{ inputs.build-artifact-name }}
           wheel-artifact-name: ${{ inputs.wheel-artifact-name }}
-      - uses: tenstorrent/tt-metal/.github/actions/ensure-bh-links-online@main
+      - uses: tenstorrent/tt-metal/.github/actions/ensure-bh-links-online@williamly/bh-multi-link-sleep
         timeout-minutes: 10
         with:
           runner-label: ${{ inputs.runner-label }}
@@ -278,7 +278,7 @@ jobs:
         with:
           build-artifact-name: ${{ inputs.build-artifact-name }}
           wheel-artifact-name: ${{ inputs.wheel-artifact-name }}
-      - uses: tenstorrent/tt-metal/.github/actions/ensure-bh-links-online@main
+      - uses: tenstorrent/tt-metal/.github/actions/ensure-bh-links-online@williamly/bh-multi-link-sleep
         timeout-minutes: 10
         with:
           runner-label: ${{ inputs.runner-label }}
@@ -452,7 +452,7 @@ jobs:
         with:
           build-artifact-name: ${{ inputs.build-artifact-name }}
           wheel-artifact-name: ${{ inputs.wheel-artifact-name }}
-      - uses: tenstorrent/tt-metal/.github/actions/ensure-bh-links-online@main
+      - uses: tenstorrent/tt-metal/.github/actions/ensure-bh-links-online@williamly/bh-multi-link-sleep
         timeout-minutes: 10
         with:
           runner-label: ${{ inputs.runner-label }}
