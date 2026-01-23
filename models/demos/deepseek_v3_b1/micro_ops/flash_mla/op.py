@@ -195,29 +195,32 @@ class FlashMLADecode:
         TILE_WIDTH = 32  # Width is always 32
 
         q_shape = input_tensor_q.padded_shape
-        q_shape_unpadded = input_tensor_q.shape
         k_shape = input_tensor_k.padded_shape
 
-        # Q: [1, B, PNH, DH]
-        # K: [B, NKV, S, DH]
-        B = q_shape[1]
-        PNH = q_shape[2]
+        # Q: [1, 1, total_q_heads, DH] - Q is height-sharded across output cores
+        # K: [Bkv, NKV, S, DH]
+        num_q_heads_per_core = input_tensor_q.memory_config().shard_spec.shape[0]  # Q heads per core from shard height
+        total_q_heads = q_shape[2]
         S = k_shape[2]
         DH = k_shape[3]
 
+        # Validate Q tensor assumptions
+        assert q_shape[0] == 1, f"Q dim 0 must be 1, got {q_shape[0]}"
+        assert q_shape[1] == 1, f"Q batch dim must be 1, got {q_shape[1]}"
+        assert num_q_heads_per_core < 32, f"num_q_heads_per_core must be < 32, got {num_q_heads_per_core}"
+        assert (
+            total_q_heads % num_q_heads_per_core == 0
+        ), f"total_q_heads ({total_q_heads}) must be divisible by num_q_heads_per_core ({num_q_heads_per_core})"
+
+        # B = number of Q shards (output cores), each processing num_q_heads_per_core heads
+        B = total_q_heads // num_q_heads_per_core
+
         num_kv_heads = k_shape[1]
-        num_q_heads = q_shape_unpadded[2]
-
-        # Q heads parallel factor (Q is always sharded for MLA)
-        q_shard_height = input_tensor_q.memory_config().shard_spec.shape[0]
-        q_heads_parallel_factor = max(1, (num_q_heads + q_shard_height - 1) // q_shard_height)
-        B *= q_heads_parallel_factor  # Adjust batch size to account for Q sharding
-
         Bkv = k_shape[0]
         St = S // K_TILE_HEIGHT  # K/V use standard tile height
         DHt = DH // TILE_WIDTH
         vDHt = head_dim_v // TILE_WIDTH
-        PNHt = PNH // q_heads_parallel_factor // Q_TILE_HEIGHT  # Q uses its own tile height
+        PNHt = num_q_heads_per_core // Q_TILE_HEIGHT  # Q uses its own tile height
 
         Sk_chunk_t = k_chunk_size // K_TILE_HEIGHT  # K chunks use K tile height
 
@@ -410,7 +413,7 @@ class FlashMLADecode:
         tilize_q = input_tensor_q.layout == ttnn.ROW_MAJOR_LAYOUT
 
         # Q chunk size bytes
-        q_chunk_size_bytes = q_tiles * (num_q_heads * TILE_WIDTH * 2 if tilize_q else q_tile_size)
+        q_chunk_size_bytes = q_tiles * (num_q_heads_per_core * TILE_WIDTH * 2 if tilize_q else q_tile_size)
 
         # Reader compile time args (simplified for sharded Q/output)
         reader_compile_time_args = [
@@ -426,7 +429,7 @@ class FlashMLADecode:
             index_stick_size,  # 9
             num_kv_heads,  # 10
             Bkv,  # 11
-            q_heads_parallel_factor,  # 12
+            B,  # 12: q_heads_parallel_factor = num Q shards (maps cur_batch to actual batch)
             num_cores_per_head,  # 13
             num_heads_per_core,  # 14
             num_output_cores,  # 15
@@ -459,7 +462,7 @@ class FlashMLADecode:
             num_heads_per_core,  # 13
             num_reducer_cores,  # 14
             max_dynamic_chunk_size,  # 15
-            q_heads_parallel_factor,  # 16
+            B,  # 16: q_heads_parallel_factor = num Q shards (maps cur_batch to actual batch)
             Q_TILE_HEIGHT,  # 17: Q tile height for tiny tile support
         ]
 
@@ -488,7 +491,7 @@ class FlashMLADecode:
             num_heads_per_core,  # 20
             max_dynamic_chunk_size,  # 21
             1 if tilize_q else 0,  # 22
-            q_heads_parallel_factor,  # 23
+            B,  # 23: q_heads_parallel_factor = num Q shards (maps cur_batch to actual batch)
             Q_TILE_HEIGHT,  # 24: Q tile height for vector mode selection
             scale_uint32,  # 25
         ]
