@@ -41,11 +41,20 @@ def create_replicated_q_shard_spec(device, batch, nh, d, num_cores_per_head=4):
     print(f"grid_x: {grid_x}, grid_y: {grid_y}")
 
     # Build core list in the exact SDPA order (matching program factory)
+    tile_h = 4
+    tile_w = 4
+
+    num_tiles_y = grid_y // tile_h  # 2
+    num_tiles_x = grid_x // tile_w  # 2
+
     core_list = []
-
-    for i in range(total_cores):
-        core_list.append((i % grid_x, i // grid_x))
-
+    for tile_y in range(num_tiles_y):  # quadrant rows
+        for tile_x in range(num_tiles_x):  # quadrant cols
+            for local_y in range(tile_h):  # row inside quadrant
+                for local_x in range(tile_w):  # col inside quadrant
+                    x = tile_x * tile_w + local_x
+                    y = tile_y * tile_h + local_y
+                    core_list.append((x, y))
     print(f"core_list: {core_list}")
     # Create core range set from the list
     core_range_set = ttnn.CoreRangeSet(
@@ -70,7 +79,7 @@ def create_replicated_q_shard_spec(device, batch, nh, d, num_cores_per_head=4):
 @pytest.mark.parametrize(
     "seq_len",
     [
-        128,  # Long sequence length
+        1024,  # Long sequence length
     ],
 )
 @pytest.mark.parametrize(

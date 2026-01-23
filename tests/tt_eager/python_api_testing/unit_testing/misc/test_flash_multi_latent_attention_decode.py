@@ -251,7 +251,7 @@ def run_flash_mla_decode_impl(
         )
 
     q_chunk_size = 0  # Not used in decode
-    k_chunk_size = 32
+    k_chunk_size = 128
 
     scale = (kv_lora_rank + d_rope) ** -0.5
 

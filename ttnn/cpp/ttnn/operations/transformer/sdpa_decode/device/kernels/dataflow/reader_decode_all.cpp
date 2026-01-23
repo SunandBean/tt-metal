@@ -47,8 +47,9 @@ void kernel_main() {
     constexpr bool is_page_table_sharded = get_compile_time_arg_val(28);
     constexpr uint32_t q_page_size_bytes = get_compile_time_arg_val(29);
     constexpr uint32_t sliding_window_size = get_compile_time_arg_val(30);
+    constexpr uint32_t k_mcast_semaphore_id = get_compile_time_arg_val(31);
 
-    constexpr auto k_args = TensorAccessorArgs<31>();
+    constexpr auto k_args = TensorAccessorArgs<32>();
     constexpr auto q_args = TensorAccessorArgs<k_args.next_compile_time_args_offset()>();
     constexpr auto v_args = TensorAccessorArgs<q_args.next_compile_time_args_offset()>();
     constexpr auto mask_args = TensorAccessorArgs<v_args.next_compile_time_args_offset()>();
@@ -72,7 +73,11 @@ void kernel_main() {
     const uint32_t core_num_in_reduce = get_arg_val<uint32_t>(arg_idx++);
     const uint32_t core_num_in_output = get_arg_val<uint32_t>(arg_idx++);
     const uint32_t cur_pos_arg = get_arg_val<uint32_t>(arg_idx++);
-
+    const bool do_k_mcast = get_arg_val<uint32_t>(arg_idx++);
+    const uint32_t mcast_x = get_arg_val<uint32_t>(arg_idx++);
+    const uint32_t mcast_y0 = get_arg_val<uint32_t>(arg_idx++);
+    const uint32_t mcast_y1 = get_arg_val<uint32_t>(arg_idx++);
+    const uint32_t num_dests = get_arg_val<uint32_t>(arg_idx++);
     // DPRINT << "B: " << B << ENDL();
     // DPRINT << "PNHt: " << PNHt << ENDL();
     // DPRINT << "St: " << St << ENDL();
@@ -206,6 +211,9 @@ void kernel_main() {
     constexpr uint32_t barrier_threshold = get_barrier_read_threshold<q_tile_bytes, num_cores>();
     uint32_t barrier_count = 0;
 
+    uint32_t k_mcast_sem_addr = get_semaphore(k_mcast_semaphore_id);
+    volatile tt_l1_ptr uint32_t* k_mcast_sem_ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(k_mcast_sem_addr);
+
     // First, read Q entirely, it could be interleaved or sharded
     uint32_t q_batch_offset = cur_batch * q_chunk_tiles;
 
@@ -336,14 +344,16 @@ void kernel_main() {
             for (uint32_t k_chunk = k_chunk_start; k_chunk < k_chunk_end; ++k_chunk) {
                 const uint32_t k_chunk_start_row_num = k_chunk * Sk_chunk_t_dynamic;
                 uint64_t k_base_read_ptr;
-                {
-                    DeviceZoneScopedN("read K chunk");
+                uint32_t mcast_tile_bytes = k_chunk_tiles * k_tile_bytes;
+                if (do_k_mcast) {
+                    DeviceZoneScopedN("read K chunk mcaster");
                     // Read K chunk in row-major order (to simplify page mapping). Write tiles to CB in transposed
                     // order.
                     cb_reserve_back(cb_k_in, k_chunk_tiles);
                     uint32_t k_write_ptr = get_write_ptr(cb_k_in);
                     k_base_read_ptr = get_noc_addr(k_write_ptr);
                     barrier_count = 0;
+                    DPRINT << "reading k chunk mcaster" << ENDL();
                     for (uint32_t row = 0; row < Sk_chunk_t_dynamic; ++row) {
                         uint32_t k_write_ptr_col = k_write_ptr + row * k_tile_bytes;
                         uint32_t virtual_k_tile_row_num = k_chunk_start_row_num + row;
@@ -366,7 +376,57 @@ void kernel_main() {
                         }
                     }
                     noc_async_read_barrier();
+                    DPRINT << "finished reading k chunk mcaster" << ENDL();
+                    // 2) Loader -> all 4 cores via multicast (down the column)
+                    uint64_t dst_mcast_addr = get_noc_multicast_addr(
+                        mcast_x,   // x_start
+                        mcast_y0,  // y_start
+                        mcast_x,   // x_end  (same column)
+                        mcast_y1,  // y_end
+                        k_write_ptr);
+
+                    noc_async_write_multicast(
+                        k_write_ptr,
+                        dst_mcast_addr,
+                        mcast_tile_bytes,
+                        num_dests,  // 3 cores (we dont include the source core)
+                        /*linked=*/false);
+
+                    DPRINT << "issues write data multicast" << ENDL();
+
+                    // Ensure all the data multicasts are actually completed on the NoC
+                    noc_async_write_barrier();
+                    DPRINT << "finished writing data multicast" << ENDL();
+
+                    // 3) Signal “tiles ready” via semaphore multicast
+
+                    // Set local semaphore value to VALID (choose any nonzero, e.g. 1)
+                    constexpr uint32_t VALID = 1;
+                    noc_semaphore_set(k_mcast_sem_ptr, VALID);
+                    DPRINT << "finished setting semaphore" << ENDL();
+                    // Multicast this semaphore value to all 4 cores (including loader)
+                    uint64_t sem_mcast_addr =
+                        get_noc_multicast_addr(mcast_x, mcast_y0, mcast_x, mcast_y1, k_mcast_sem_addr);
+
+                    bool linked = (k_chunk == k_chunk_end - 1) ? true : false;
+                    noc_semaphore_set_multicast(
+                        k_mcast_sem_addr,  // L1 src addr to send (4B)
+                        sem_mcast_addr,    // multicast grid + local addr
+                        num_dests,         // 3 cores (we dont include the source core)
+                        false);
+                    DPRINT << "finished writing semaphore multicast" << ENDL();
                     cb_push_back(cb_k_in, k_chunk_tiles);
+                    DPRINT << "finished pushing back cb_k_in" << ENDL();
+                } else {
+                    DeviceZoneScopedN("read K chunk non-mcaster");
+                    DPRINT << "waiting for k mcast semaphore" << ENDL();
+                    noc_semaphore_wait(k_mcast_sem_ptr, 1);
+                    DPRINT << "finished waiting for k mcast semaphore" << ENDL();
+                    cb_reserve_back(cb_k_in, k_chunk_tiles);
+                    DPRINT << "finishing reserving cb_k_in" << ENDL();
+                    DPRINT << "pushing back cb_k_in" << ENDL();
+                    cb_push_back(cb_k_in, k_chunk_tiles);
+                    DPRINT << "finishing pushing back cb_k_in" << ENDL();
                 }
 
                 if constexpr (use_attention_mask) {
