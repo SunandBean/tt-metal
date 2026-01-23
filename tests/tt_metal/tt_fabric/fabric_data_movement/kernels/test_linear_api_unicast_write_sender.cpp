@@ -17,6 +17,8 @@ using namespace tt::tt_fabric::mesh::experimental;
 #include "test_linear_common.hpp"
 #include "tests/tt_metal/tt_metal/perf_microbenchmark/routing/kernels/tt_fabric_traffic_gen.hpp"
 #include "tt_metal/fabric/hw/inc/edm_fabric/routing_plane_connection_manager.hpp"
+#include "test_host_kernel_common.hpp"
+using tt::tt_fabric::fabric_router_tests::FabricPacketType;
 
 constexpr uint32_t test_results_addr_arg = get_compile_time_arg_val(0);
 constexpr uint32_t test_results_size_bytes = get_compile_time_arg_val(1);
@@ -26,8 +28,7 @@ uint32_t target_address = get_compile_time_arg_val(3);
 constexpr NocSendType noc_send_type = static_cast<NocSendType>(get_compile_time_arg_val(4));
 constexpr uint32_t num_send_dir = get_compile_time_arg_val(5);
 constexpr bool with_state = get_compile_time_arg_val(6) == 1;
-constexpr bool is_chip_multicast = get_compile_time_arg_val(7) == 1;
-constexpr bool is_sparse_multicast = get_compile_time_arg_val(8) == 1;
+constexpr FabricPacketType fabric_packet_type = static_cast<FabricPacketType>(get_compile_time_arg_val(7));
 
 void kernel_main() {
     size_t rt_arg_idx = 0;
@@ -37,13 +38,12 @@ void kernel_main() {
     uint32_t time_seed = get_arg_val<uint32_t>(rt_arg_idx++);
     uint32_t noc_x_start = get_arg_val<uint32_t>(rt_arg_idx++);
     uint32_t noc_y_start = get_arg_val<uint32_t>(rt_arg_idx++);
-    auto hop_info = is_sparse_multicast ? get_sparse_hop_info_from_args<is_sparse_multicast, num_send_dir>(rt_arg_idx)
-                                        : get_hop_info_from_args<is_chip_multicast, num_send_dir>(rt_arg_idx);
+    auto hop_info = get_hop_info_from_args<fabric_packet_type, num_send_dir>(rt_arg_idx);
 
 #ifdef API_TYPE_Mesh
     // Build MeshMcastRange array from hop_info once
     MeshMcastRange ranges[num_send_dir];
-    if constexpr (is_chip_multicast) {
+    if constexpr (fabric_packet_type == FabricPacketType::CHIP_MULTICAST) {
         for (uint32_t i = 0; i < num_send_dir; i++) {
             ranges[i].e = hop_info.mcast.e[i];
             ranges[i].w = hop_info.mcast.w[i];
@@ -63,7 +63,7 @@ void kernel_main() {
     uint64_t start_timestamp = get_timestamp();
 
     if constexpr (with_state) {
-        set_state<num_send_dir, is_chip_multicast, noc_send_type>(
+        set_state<num_send_dir, fabric_packet_type, noc_send_type>(
             connections, route_id, hop_info, static_cast<uint16_t>(packet_payload_size_bytes));
     }
 
@@ -73,19 +73,26 @@ void kernel_main() {
         fill_packet_data(start_addr, packet_payload_size_bytes / 16, time_seed);
 
 #ifdef API_TYPE_Linear
-        if constexpr (is_chip_multicast) {
+        if constexpr (fabric_packet_type == FabricPacketType::CHIP_SPARSE_MULTICAST) {
+            // Currently sparse multicast has only been tested for NoC Unicast Writes
             switch (noc_send_type) {
                 case NOC_UNICAST_WRITE: {
-                    if constexpr (is_sparse_multicast) {
-                        fabric_sparse_multicast_noc_unicast_write(
-                            connections,
-                            route_id,
-                            source_l1_buffer_address,
-                            packet_payload_size_bytes,
-                            tt::tt_fabric::NocUnicastCommandHeader{
-                                get_noc_addr(noc_x_start, noc_y_start, target_address)},
-                            hop_info.sparse_mcast.hops);
-                    } else if constexpr (with_state) {
+                    fabric_sparse_multicast_noc_unicast_write(
+                        connections,
+                        route_id,
+                        source_l1_buffer_address,
+                        packet_payload_size_bytes,
+                        tt::tt_fabric::NocUnicastCommandHeader{get_noc_addr(noc_x_start, noc_y_start, target_address)},
+                        hop_info.sparse_mcast.hop_mask);
+                } break;
+                default: {
+                    ASSERT(false);
+                } break;
+            }
+        } else if constexpr (fabric_packet_type == FabricPacketType::CHIP_MULTICAST) {
+            switch (noc_send_type) {
+                case NOC_UNICAST_WRITE: {
+                    if constexpr (with_state) {
                         fabric_multicast_noc_unicast_write_with_state<UnicastWriteUpdateMask::DstAddr>(
                             connections,
                             route_id,
@@ -214,7 +221,9 @@ void kernel_main() {
             }
         }
 #elif defined(API_TYPE_Mesh)
-        if constexpr (is_chip_multicast) {
+        if constexpr (fabric_packet_type == FabricPacketType::CHIP_SPARSE_MULTICAST) {
+            ASSERT(false);  // Sparse multicast is not currently supported for Mesh
+        } else if constexpr (fabric_packet_type == FabricPacketType::CHIP_MULTICAST) {
             switch (noc_send_type) {
                 case NOC_UNICAST_WRITE: {
                     if constexpr (with_state) {

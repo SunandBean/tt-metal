@@ -37,6 +37,7 @@
 #include "tt_metal/fabric/fabric_context.hpp"
 #include "tt_metal/fabric/fabric_builder_context.hpp"
 #include <umd/device/types/core_coordinates.hpp>
+#include "kernels/test_host_kernel_common.hpp"
 
 namespace tt::tt_fabric::fabric_router_tests {
 std::random_device rd;  // Non-deterministic seed source
@@ -2174,8 +2175,7 @@ void FabricUnicastCommon(
         noc_send_type,
         static_cast<uint32_t>(dir_configs.size()),
         with_state,
-        0  // is_chip_multicast = 0
-    };
+        static_cast<uint32_t>(FabricPacketType::CHIP_UNICAST)};
 
     if (noc_send_type == NOC_UNICAST_INLINE_WRITE) {
         worker_mem_map.packet_payload_size_bytes = 4;
@@ -3025,8 +3025,7 @@ void Fabric2DMulticastCommon(
         noc_send_type,
         num_connections,  // Number of connections (multicast routes)
         with_state,
-        1  // is_chip_multicast = 1
-    };
+        static_cast<uint32_t>(FabricPacketType::CHIP_MULTICAST)};
 
     std::vector<uint32_t> sender_runtime_args = {
         worker_mem_map.source_l1_buffer_address,
@@ -3210,9 +3209,7 @@ void FabricMulticastCommon(
         noc_send_type,
         static_cast<uint32_t>(dir_configs.size()),
         with_state,
-        1,  // is_chip_multicast = 1
-        0   // is_sparse_multicast = 0
-    };
+        static_cast<uint32_t>(FabricPacketType::CHIP_MULTICAST)};
 
     std::vector<uint32_t> sender_runtime_args = {
         worker_mem_map.source_l1_buffer_address,
@@ -3489,9 +3486,7 @@ void FabricSparseMulticastCommon(
         NOC_UNICAST_WRITE,  // Only support NOC_UNICAST_WRITE for sparse multicast
         static_cast<uint32_t>(dir_configs.size()),
         0,  // with_state = false (not supported for sparse multicast)
-        1,  // is_chip_multicast = true
-        1   // is_sparse_multicast = true
-    };
+        static_cast<uint32_t>(FabricPacketType::CHIP_SPARSE_MULTICAST)};
 
     std::vector<uint32_t> sender_runtime_args = {
         worker_mem_map.source_l1_buffer_address,

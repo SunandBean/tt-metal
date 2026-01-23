@@ -14,6 +14,8 @@ using namespace tt::tt_fabric::mesh::experimental;
 #error "API_TYPE_Linear or API_TYPE_Mesh must be defined"
 #endif
 #include "fabric/fabric_edm_packet_header.hpp"
+#include "test_host_kernel_common.hpp"
+using tt::tt_fabric::fabric_router_tests::FabricPacketType;
 
 template <uint8_t num_send_dir>
 union HopInfo {
@@ -26,7 +28,7 @@ union HopInfo {
         uint8_t range[num_send_dir];
     } mcast;
     struct {
-        uint16_t hops[num_send_dir];  // Sparse multicast hop bitmask
+        uint16_t hop_mask[num_send_dir];  // Sparse multicast hop bitmask
     } sparse_mcast;
 #elif defined(API_TYPE_Mesh)
     struct {
@@ -39,10 +41,18 @@ union HopInfo {
 #endif
 };
 
-template <bool is_chip_multicast, uint8_t num_send_dir>
+template <FabricPacketType fabric_packet_type, uint8_t num_send_dir>
 HopInfo<num_send_dir> get_hop_info_from_args(size_t& rt_arg_idx) {
     HopInfo<num_send_dir> hop_info;
-    if constexpr (is_chip_multicast) {
+    if constexpr (fabric_packet_type == FabricPacketType::CHIP_SPARSE_MULTICAST) {
+#ifdef API_TYPE_Linear
+        for (uint32_t i = 0; i < num_send_dir; i++) {
+            hop_info.sparse_mcast.hop_mask[i] = static_cast<uint16_t>(get_arg_val<uint32_t>(rt_arg_idx++));
+        }
+#elif defined(API_TYPE_Mesh)
+        ASSERT(false);  // Sparse multicast is not currently supported for Mesh
+#endif
+    } else if constexpr (fabric_packet_type == FabricPacketType::CHIP_MULTICAST) {
 #ifdef API_TYPE_Linear
         for (uint32_t i = 0; i < num_send_dir; i++) {
             hop_info.mcast.start_distance[i] = static_cast<uint8_t>(get_arg_val<uint32_t>(rt_arg_idx++));
@@ -65,32 +75,17 @@ HopInfo<num_send_dir> get_hop_info_from_args(size_t& rt_arg_idx) {
     return hop_info;
 }
 
-template <bool is_sparse_multicast, uint8_t num_send_dir>
-HopInfo<num_send_dir> get_sparse_hop_info_from_args(size_t& rt_arg_idx) {
-    HopInfo<num_send_dir> hop_info;
-    if constexpr (is_sparse_multicast) {
-#ifdef API_TYPE_Linear
-        for (uint32_t i = 0; i < num_send_dir; i++) {
-            hop_info.sparse_mcast.hops[i] = static_cast<uint16_t>(get_arg_val<uint32_t>(rt_arg_idx++));
-        }
-#endif
-    } else {
-        for (uint32_t i = 0; i < num_send_dir; i++) {
-            hop_info.ucast.num_hops[i] = static_cast<uint8_t>(get_arg_val<uint32_t>(rt_arg_idx++));
-        }
-    }
-    return hop_info;
-}
-
 // Set-state helper: field selection via template; packet size is runtime argument when applicable
-template <uint8_t num_send_dir, bool is_chip_multicast, tt::tt_fabric::NocSendType noc_send_type>
+template <uint8_t num_send_dir, FabricPacketType fabric_packet_type, tt::tt_fabric::NocSendType noc_send_type>
 void set_state(
     tt::tt_fabric::RoutingPlaneConnectionManager& connection_manager,
     uint8_t route_id,
     HopInfo<num_send_dir>& hop_info,
     uint16_t packet_size) {
 #ifdef API_TYPE_Linear
-    if constexpr (is_chip_multicast) {
+    if constexpr (fabric_packet_type == FabricPacketType::CHIP_SPARSE_MULTICAST) {
+        ASSERT(false);  // Stateful sparse multicast has not been tested yet
+    } else if constexpr (fabric_packet_type == FabricPacketType::CHIP_MULTICAST) {
         switch (noc_send_type) {
             case NOC_UNICAST_WRITE: {
                 fabric_multicast_noc_unicast_write_set_state<UnicastWriteUpdateMask::PayloadSize>(
@@ -192,7 +187,9 @@ void set_state(
         }
     }
 #elif defined(API_TYPE_Mesh)
-    if constexpr (is_chip_multicast) {
+    if constexpr (fabric_packet_type == FabricPacketType::CHIP_SPARSE_MULTICAST) {
+        ASSERT(false);  // Sparse multicast is not currently supported for Mesh
+    } else if constexpr (fabric_packet_type == FabricPacketType::CHIP_MULTICAST) {
         // Build MeshMcastRange array from hop_info
         MeshMcastRange ranges[num_send_dir];
         for (uint32_t i = 0; i < num_send_dir; i++) {
