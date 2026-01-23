@@ -142,9 +142,9 @@ class FlashMLADecode:
         head_dim_v: int,
         cur_pos_tensor: ttnn.Tensor,
         output_tensor: ttnn.Tensor,
-        scale: float = None,
-        program_config: "ttnn.SDPAProgramConfig" = None,
-        compute_kernel_config: "ttnn.DeviceComputeKernelConfig" = None,
+        scale: float,
+        program_config: "ttnn.SDPAProgramConfig",
+        compute_kernel_config: "ttnn.DeviceComputeKernelConfig",
     ) -> ttnn.Tensor:
         """
         Execute flash MLA decode operation using ttnn.generic_op.
@@ -157,9 +157,9 @@ class FlashMLADecode:
             head_dim_v: The value head dimension (first head_dim_v elements of kvpe_dim)
             cur_pos_tensor: Current position tensor [batch] (int32)
             output_tensor: Pre-allocated output tensor [1, batch, num_heads, head_dim_v]
-            scale: Attention scale factor (optional, computed if not provided)
+            scale: Attention scale factor
             program_config: ttnn.SDPAProgramConfig with k_chunk_size and exp_approx_mode
-            compute_kernel_config: ttnn.DeviceComputeKernelConfig (optional)
+            compute_kernel_config: ttnn.DeviceComputeKernelConfig
 
         Returns:
             Output tensor with attention result [1, batch, num_heads, head_dim_v]
@@ -167,38 +167,22 @@ class FlashMLADecode:
         # =========================================================================
         # Extract parameters (matching C++ lines 40-55)
         # =========================================================================
-        use_mla = True  # This is the MLA variant
         input_tensor_q = q_tensor
         input_tensor_k = kv_cache_tensor
         input_tensor_v = kv_cache_tensor  # MLA: V is same as K
 
         device = input_tensor_q.device()
 
-        # Scale (C++ lines 41-43)
-        if scale is None:
-            scale = 1.0 / math.sqrt(float(input_tensor_q.padded_shape[-1]))
-
         # Program config parameters
-        if program_config is not None:
-            k_chunk_size = program_config.k_chunk_size
-            exp_approx_mode = program_config.exp_approx_mode if program_config.exp_approx_mode is not None else True
-            grid_size = program_config.compute_with_storage_grid_size
-        else:
-            k_chunk_size = 128
-            exp_approx_mode = True
-            grid_size = device.compute_with_storage_grid_size()
+        k_chunk_size = program_config.k_chunk_size
+        exp_approx_mode = program_config.exp_approx_mode if program_config.exp_approx_mode is not None else True
+        grid_size = program_config.compute_with_storage_grid_size
 
         # Compute kernel config
-        if compute_kernel_config is not None:
-            math_fidelity = compute_kernel_config.math_fidelity
-            math_approx_mode = compute_kernel_config.math_approx_mode
-            fp32_dest_acc_en = compute_kernel_config.fp32_dest_acc_en
-            packer_l1_acc = compute_kernel_config.packer_l1_acc
-        else:
-            math_fidelity = ttnn.MathFidelity.HiFi2
-            math_approx_mode = True
-            fp32_dest_acc_en = False
-            packer_l1_acc = False
+        math_fidelity = compute_kernel_config.math_fidelity
+        math_approx_mode = compute_kernel_config.math_approx_mode
+        fp32_dest_acc_en = compute_kernel_config.fp32_dest_acc_en
+        packer_l1_acc = compute_kernel_config.packer_l1_acc
 
         # =========================================================================
         # Shape extraction (matching C++ lines 70-114)
@@ -225,16 +209,14 @@ class FlashMLADecode:
         num_q_heads = q_shape_unpadded[2]
 
         # Q heads parallel factor (Q is always sharded for MLA)
-        q_heads_parallel_factor = 1
-        if use_mla:
-            q_shard_height = input_tensor_q.memory_config().shard_spec.shape[0]
-            q_heads_parallel_factor = max(1, (num_q_heads + q_shard_height - 1) // q_shard_height)
-            B *= q_heads_parallel_factor  # Adjust batch size to account for Q sharding
+        q_shard_height = input_tensor_q.memory_config().shard_spec.shape[0]
+        q_heads_parallel_factor = max(1, (num_q_heads + q_shard_height - 1) // q_shard_height)
+        B *= q_heads_parallel_factor  # Adjust batch size to account for Q sharding
 
         Bkv = k_shape[0]
         St = S // K_TILE_HEIGHT  # K/V use standard tile height
         DHt = DH // TILE_WIDTH
-        vDHt = head_dim_v // TILE_WIDTH if use_mla else DHt
+        vDHt = head_dim_v // TILE_WIDTH
         PNHt = PNH // q_heads_parallel_factor // Q_TILE_HEIGHT  # Q uses its own tile height
 
         Sk_chunk_t = k_chunk_size // K_TILE_HEIGHT  # K chunks use K tile height

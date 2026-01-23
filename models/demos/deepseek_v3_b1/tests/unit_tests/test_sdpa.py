@@ -23,7 +23,7 @@ from models.demos.deepseek_v3_b1.micro_ops.flash_mla.op import FlashMLADecode
 # )  # 2k, 4k, 8k, 32k
 @pytest.mark.parametrize("use_python_op", [True], ids=["python"])
 @pytest.mark.parametrize("batch_size", [1])
-@pytest.mark.parametrize("decode_position", [128 - 1])  # 2k, 4k, 8k, 32k
+@pytest.mark.parametrize("decode_position", [128 - 1, 2 * 1024 - 1, 4 * 1024 - 1, 8 * 1024 - 1, 32 * 1024 - 1])
 @pytest.mark.parametrize("max_seq_len", [32 * 1024])  # 32k max sequence length per chip
 @pytest.mark.parametrize("kv_sharded", [False, True], ids=["interleaved", "sharded"])
 def test_flash_mla_decode(device, batch_size, decode_position, max_seq_len, use_python_op, kv_sharded):
@@ -32,7 +32,7 @@ def test_flash_mla_decode(device, batch_size, decode_position, max_seq_len, use_
 
     # Use 128 heads and 16 heads per core to test 8 groups of heads
     # SDPA has bug with 8x32 tile size, so can't use 64 and 8 for now
-    num_heads = 16  # TP=2, so 128 / 2 = 64 heads per device
+    num_heads = 128  # TP=2, so 128 / 2 = 64 heads per device
     num_q_heads_per_core = 16
     kv_lora_rank = 512
     qk_nope_head_dim = 128
@@ -48,7 +48,7 @@ def test_flash_mla_decode(device, batch_size, decode_position, max_seq_len, use_
     # Create sharded memory configs for Q and output
     # 8 Q heads per core, 8 cores total (can be disjoint)
     tiny_tile = ttnn.Tile((num_q_heads_per_core, 32))
-    compute_grid = ttnn.CoreCoord(8, 1)  # SDPAProgramConfig requires CoreCoord, not CoreGrid
+    compute_grid = ttnn.CoreCoord(8, 8)  # SDPAProgramConfig requires CoreCoord, not CoreGrid
     q_core_grid = ttnn.CoreRangeSet(
         [
             ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 0)),
