@@ -24,7 +24,6 @@ from models.demos.deepseek_v3_b1.micro_ops.flash_mla.op import FlashMLADecode
 @pytest.mark.parametrize("use_python_op", [True], ids=["python"])
 @pytest.mark.parametrize("batch_size", [1])
 @pytest.mark.parametrize("decode_position", [128 - 1, 2 * 1024 - 1, 4 * 1024 - 1, 8 * 1024 - 1, 32 * 1024 - 1])
-# @pytest.mark.parametrize("decode_position", [128 - 1])
 @pytest.mark.parametrize("max_seq_len", [32 * 1024])  # 32k max sequence length per chip
 @pytest.mark.parametrize("kv_sharded", [False, True], ids=["interleaved", "sharded"])
 def test_flash_mla_decode(device, batch_size, decode_position, max_seq_len, use_python_op, kv_sharded):

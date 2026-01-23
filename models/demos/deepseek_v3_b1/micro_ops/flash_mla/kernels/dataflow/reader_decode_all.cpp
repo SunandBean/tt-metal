@@ -47,16 +47,11 @@ void kernel_main() {
     constexpr uint32_t max_dynamic_chunk_size = get_compile_time_arg_val(16);
     constexpr bool tilize_q = get_compile_time_arg_val(17) == 1;
     constexpr uint32_t q_chunk_size_bytes = get_compile_time_arg_val(18);
-    // Multicast coordinates (physical NOC coords for S block bounding box)
-    constexpr uint32_t mcast_start_x = get_compile_time_arg_val(19);
-    constexpr uint32_t mcast_start_y = get_compile_time_arg_val(20);
-    constexpr uint32_t mcast_end_x = get_compile_time_arg_val(21);
-    constexpr uint32_t mcast_end_y = get_compile_time_arg_val(22);
-    constexpr uint32_t num_mcast_dests = get_compile_time_arg_val(23);
-    constexpr uint32_t mcast_semaphore_id = get_compile_time_arg_val(24);
+    constexpr uint32_t num_mcast_dests = get_compile_time_arg_val(19);
+    constexpr uint32_t mcast_semaphore_id = get_compile_time_arg_val(20);
 
     // TensorAccessorArgs for K and V (KV cache in DRAM), and pos tensor
-    constexpr auto k_args = TensorAccessorArgs<25>();  // After multicast args
+    constexpr auto k_args = TensorAccessorArgs<21>();  // After compile-time args
     constexpr auto v_args = TensorAccessorArgs<k_args.next_compile_time_args_offset()>();
     constexpr auto pos_args = TensorAccessorArgs<v_args.next_compile_time_args_offset()>();
 
@@ -73,6 +68,11 @@ void kernel_main() {
     const uint32_t core_num_in_output = get_arg_val<uint32_t>(arg_idx++);
     const uint32_t cur_pos_arg = get_arg_val<uint32_t>(arg_idx++);
     const bool is_mcast_sender = get_arg_val<uint32_t>(arg_idx++) == 1;
+    // Multicast coordinates (physical NOC coords for this core's S block bounding box)
+    const uint32_t mcast_start_x = get_arg_val<uint32_t>(arg_idx++);
+    const uint32_t mcast_start_y = get_arg_val<uint32_t>(arg_idx++);
+    const uint32_t mcast_end_x = get_arg_val<uint32_t>(arg_idx++);
+    const uint32_t mcast_end_y = get_arg_val<uint32_t>(arg_idx++);
 
     // idle core
     if (q_addr == 0) {
@@ -201,7 +201,7 @@ void kernel_main() {
                 const uint32_t k_chunk_bytes = k_chunk_tiles * k_tile_bytes;
 
                 if (is_mcast_sender) {
-                    // Sender: read from DRAM and multicast to all cores in S block
+                    // Sender: read from DRAM
                     if constexpr (k_args.is_sharded) {
                         DeviceZoneScopedN("mcast-sender-sharded-read");
                         const uint32_t shard_id = kv_batch * num_chunks_per_batch + k_chunk;
@@ -222,7 +222,7 @@ void kernel_main() {
                     }
                     noc_async_read_barrier();
 
-                    // Multicast K data to all other cores in the S block
+                    // Multicast K data to other cores in the S block
                     {
                         DeviceZoneScopedN("mcast-sender-multicast");
                         // Multicast to other cores (sender already has data from DRAM read, no loopback needed)

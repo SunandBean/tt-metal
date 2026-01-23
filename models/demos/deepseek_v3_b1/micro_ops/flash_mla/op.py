@@ -373,79 +373,70 @@ class FlashMLADecode:
         Sk_chunk_t = k_chunk_size // K_TILE_HEIGHT  # K chunks use K tile height
 
         # =========================================================================
-        # Parallelization scheme - Hard-coded S block layout
+        # Parallelization scheme - All S blocks for seq len parallelism
         # =========================================================================
-        # Use S1 block for SDPA computation (hard-coded for now)
-        # S1 has 8 cores: first B cores are output cores (hold Q shards), rest are workers
-        s_block_idx = 0  # Use S1 for now
-        s_block_cores = S_BLOCKS[s_block_idx]
+        # S1 holds Q output cores (8 cores for 8 Q shards)
+        # S2-S8 provide worker cores for sequence length parallelism
+        # Each Q shard (batch) gets: 1 output core from S1 + 7 worker cores from S2-S8
+        # Layout: Q1 uses S1[0], S2[0], S3[0], ..., S8[0]
+        #         Q2 uses S1[1], S2[1], S3[1], ..., S8[1], etc.
+        num_s_blocks = len(S_BLOCKS)  # 8 S blocks
+        cores_per_s_block = len(S1_CORES)  # 8 cores per S block
 
-        # Get multicast coordinates for KV cache broadcast (in physical NOC space)
-        # NOC is a torus architecture, so wraparound multicast works correctly
-        (
-            mcast_start_x,
-            mcast_start_y,
-            mcast_end_x,
-            mcast_end_y,
-            num_mcast_dests,
-        ) = get_s_block_physical_multicast_coords(device, s_block_idx)
+        # Validate Q shards fit in one S block (max 8 Q shards)
+        assert B <= cores_per_s_block, f"Too many Q shards ({B}), max is {cores_per_s_block}"
 
-        # Validate S block has enough cores for the Q shards
-        assert B <= len(
-            s_block_cores
-        ), f"S block {s_block_idx + 1} has {len(s_block_cores)} cores but need {B} output cores for Q shards"
-
-        # Validate Q tensor is sharded on the correct S block output cores
+        # Validate Q tensor is sharded on S1 output cores
         q_shard_grid = input_tensor_q.memory_config().shard_spec.grid
-        expected_q_cores = get_s_block_output_cores(s_block_idx, B)
+        expected_q_cores = get_s_block_output_cores(0, B)  # S1 is index 0
         for i, (expected_x, expected_y) in enumerate(expected_q_cores):
-            # Find the i-th core in the Q shard grid
             found = False
             for core_range in q_shard_grid.ranges():
-                # CoreRange uses .start and .end (CoreCoord objects)
                 for x in range(core_range.start.x, core_range.end.x + 1):
                     for y in range(core_range.start.y, core_range.end.y + 1):
                         if x == expected_x and y == expected_y:
                             found = True
                             break
             assert found, (
-                f"Q tensor must be sharded on S{s_block_idx + 1} output cores. "
+                f"Q tensor must be sharded on S1 output cores. "
                 f"Expected core ({expected_x}, {expected_y}) not found in Q shard grid."
             )
 
-        # Calculate parallelization parameters based on S block layout
-        num_cores_in_s_block = len(s_block_cores)
+        # Calculate parallelization parameters
+        # Each batch (Q shard) gets 8 cores: 1 from each S block
+        num_cores_per_batch = num_s_blocks  # 8 cores per Q shard (seq len parallelism)
         num_output_cores = B  # Number of Q shards = number of output cores
-        num_cores_per_batch = num_cores_in_s_block // B  # Cores per Q shard for seq len parallelism
+        num_active_cores = B * num_cores_per_batch  # Total active cores
         num_cores_per_head = num_cores_per_batch // num_kv_heads  # Cores per KV head
         num_heads_per_core = max(1, math.ceil(num_kv_heads / num_cores_per_batch))
         num_reducer_cores = num_kv_heads * B // num_heads_per_core
-        num_active_cores = num_cores_in_s_block
 
-        # Build core grid from S block
+        # Build all_cores list: for each batch, collect cores across all S blocks
+        # This gives the interleaved layout needed for parallelization
+        all_cores = []
+        for batch_idx in range(B):
+            for s_block_idx in range(num_s_blocks):
+                x, y = S_BLOCKS[s_block_idx][batch_idx]
+                all_cores.append((x, y))
+
+        # Build core grid from all active cores
         core_grid = ttnn.CoreRangeSet(
-            [ttnn.CoreRange(ttnn.CoreCoord(x, y), ttnn.CoreCoord(x, y)) for x, y in s_block_cores]
+            [ttnn.CoreRange(ttnn.CoreCoord(x, y), ttnn.CoreCoord(x, y)) for x, y in all_cores]
         )
 
-        # Create core group from S block cores
-        # Layout: output cores first (hold Q shards), then worker cores for seq len parallelism
-        core_group = []
+        # Create core group with the same layout
+        core_group = [ttnn.CoreCoord(x, y) for x, y in all_cores]
         core_group_idle = []
 
-        # Interleave output cores and workers: for each batch, output core first, then workers
-        for batch_idx in range(B):
-            # Output core for this batch (first core in each batch's allocation)
-            output_core_idx = batch_idx * num_cores_per_batch
-            if output_core_idx < len(s_block_cores):
-                x, y = s_block_cores[output_core_idx]
-                core_group.append(ttnn.CoreCoord(x, y))
+        # Multicast: each S block's first core (Q1) reads KV and multicasts to others in that S block
+        # Since all S blocks have 8 cores, num_mcast_dests is the same for all (7 = 8-1)
+        num_mcast_dests = cores_per_s_block - 1  # 7 receivers per S block
 
-            # Worker cores for this batch
-            for worker_offset in range(1, num_cores_per_batch):
-                worker_core_idx = batch_idx * num_cores_per_batch + worker_offset
-                if worker_core_idx < len(s_block_cores):
-                    x, y = s_block_cores[worker_core_idx]
-                    core_group.append(ttnn.CoreCoord(x, y))
+        # Pre-compute physical multicast coordinates for each S block (used in runtime args)
+        s_block_mcast_coords = []
+        for s_idx in range(num_s_blocks):
+            coords = get_s_block_physical_multicast_coords(device, s_idx)
+            s_block_mcast_coords.append(coords)
 
         # =========================================================================
         # CB tile counts (matching C++ lines 285-299)
@@ -612,13 +603,8 @@ class FlashMLADecode:
             max_dynamic_chunk_size,  # 16
             1 if tilize_q else 0,  # 17
             q_chunk_size_bytes,  # 18
-            # Multicast coordinates (physical NOC coords from get_s_block_physical_multicast_coords)
-            mcast_start_x,  # 19
-            mcast_start_y,  # 20
-            mcast_end_x,  # 21
-            mcast_end_y,  # 22
-            num_mcast_dests,  # 23
-            2,  # 24: mcast_semaphore_id (semaphore for KV cache multicast)
+            num_mcast_dests,  # 19: multicast destinations (7 = 8 cores per S block - 1 sender)
+            2,  # 20: mcast_semaphore_id (semaphore for KV cache multicast)
         ]
         # TensorAccessorArgs for K, V (KV cache - can be interleaved or height-sharded), and pos tensor
         reader_compile_time_args.extend(get_tensor_accessor_args(kv_cache_tensor))  # K
@@ -998,8 +984,15 @@ class FlashMLADecode:
 
             cur_pos = 0xFFFFFFFF  # -1 in unsigned, means use cur_pos_tensor
 
-            # Multicast sender: only core 0 (q1) reads from DRAM and multicasts to all others
-            is_mcast_sender = 1 if i == 0 else 0
+            # Multicast: within each S block, first core (Q1) reads and multicasts to others
+            # Core layout: [S1[0], S2[0], ..., S8[0], S1[1], S2[1], ..., S8[1], ...]
+            # s_block_idx = i % num_s_blocks determines which S block this core belongs to
+            # is_mcast_sender = 1 for first core of each S block (i < num_s_blocks)
+            s_block_idx = i % num_s_blocks
+            is_mcast_sender = 1 if i < num_s_blocks else 0
+
+            # Get multicast coordinates for this core's S block (physical NOC coords)
+            mcast_start_x, mcast_start_y, mcast_end_x, mcast_end_y, _ = s_block_mcast_coords[s_block_idx]
 
             # Reader runtime args (simplified)
             reader_runtime_args = [
@@ -1014,7 +1007,11 @@ class FlashMLADecode:
                 core_num_in_reduce,
                 core_num_in_output,
                 cur_pos,
-                is_mcast_sender,  # NEW: whether this core is the multicast sender
+                is_mcast_sender,
+                mcast_start_x,
+                mcast_start_y,
+                mcast_end_x,
+                mcast_end_y,
             ]
             reader_runtime_args.extend(output_core_physical_xs)
             reader_runtime_args.extend(output_core_physical_ys)
@@ -1051,7 +1048,8 @@ class FlashMLADecode:
         # Add runtime args for idle cores
         for core in core_group_idle:
             # Idle cores get zero/placeholder runtime args
-            idle_reader_runtime_args = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]  # Added is_mcast_sender=0
+            # 12 base args + 4 mcast coords = 16 args before output core lists
+            idle_reader_runtime_args = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
             idle_reader_runtime_args.extend([0] * len(output_core_physical_xs))
             idle_reader_runtime_args.extend([0] * len(output_core_physical_ys))
 
@@ -1076,7 +1074,7 @@ class FlashMLADecode:
                 compile_time_args=reader_compile_time_args,
                 runtime_args=reader_rtargs,
                 config=ttnn.DataMovementConfigDescriptor(
-                    processor=ttnn.DataMovementProcessor.RISCV_0,
+                    processor=ttnn.DataMovementProcessor.RISCV_1,
                     noc=ttnn.NOC.NOC_0,
                 ),
             ),
@@ -1088,7 +1086,7 @@ class FlashMLADecode:
                 compile_time_args=writer_compile_time_args,
                 runtime_args=writer_rtargs,
                 config=ttnn.DataMovementConfigDescriptor(
-                    processor=ttnn.DataMovementProcessor.RISCV_1,
+                    processor=ttnn.DataMovementProcessor.RISCV_0,
                     noc=ttnn.NOC.NOC_1,
                 ),
             ),
