@@ -583,7 +583,9 @@ ALWI void cb_matmul_blocks(
     const bool& transpose,
     const bool& add_mask,
     const uint32_t& mask_cb,
-    const uint32_t& zero_cb) {
+    const uint32_t& zero_cb,
+    const bool& pop_in1_cb,
+    const uint32_t& pop_in1_cb_num_tiles) {
     // precondition: in0_cb has M*K produced
     // preconditino: in1_cb has K*N produced
     // postcondition: in0_cb is full, in1_cb is empty
@@ -635,5 +637,7 @@ ALWI void cb_matmul_blocks(
         }
         in0_index_offset += subblock_h * in0_block_w;
     }
-    cb_pop_front(in1_cb, K * N);
+    if (pop_in1_cb) {
+        cb_pop_front(in1_cb, pop_in1_cb_num_tiles);
+    }
 }

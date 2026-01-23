@@ -220,6 +220,7 @@ void MAIN {
     const uint32_t out_num_blocks_dynamic = 1;
 
     const uint32_t qk_chunk_tiles_dynamic = Sq_chunk_t * Sk_chunk_t_dynamic;
+    const uint32_t k_chunk_tiles_dynamic = Sk_chunk_t_dynamic * DHt;
 #else
     constexpr uint32_t qk_subblock_h_dynamic = qk_subblock_h;
     constexpr uint32_t qk_subblock_w_dynamic = qk_subblock_w;
@@ -227,8 +228,8 @@ void MAIN {
     constexpr uint32_t qk_in1_num_subblocks_dynamic = qk_in1_num_subblocks;
     constexpr uint32_t out_in0_block_w_dynamic = out_in0_block_w;
     constexpr uint32_t out_num_blocks_dynamic = out_num_blocks;
-
     constexpr uint32_t qk_chunk_tiles_dynamic = Sq_chunk_t * Sk_chunk_t;
+    constexpr uint32_t k_chunk_tiles_dynamic = Sk_chunk_t * DHt;
 #endif
 
     // TODO: Used for legacy sfpu functions
@@ -341,7 +342,10 @@ void MAIN {
                         true,
                         add_mask_fusion,
                         mask_cb_to_use,
-                        cb_zero_in);
+                        cb_zero_in,
+                        false,
+                        0  // we do not pop K buffer yet
+                    );
                 }
 
                 /* QK += MASK */
@@ -434,14 +438,14 @@ void MAIN {
                 }
 
                 /* OUT_IM = QK @ V_CHUNK */
-                reconfig_data_format(cb_qk_im, cb_v_in);  // DEBUG
+                reconfig_data_format(cb_qk_im, cb_k_in);  // DEBUG
                 pack_reconfig_data_format(cb_out_im);
 
                 {
                     DeviceZoneScopedN("Out V matmul");
                     cb_matmul_blocks(
                         cb_qk_im,
-                        cb_v_in,
+                        cb_k_in,
                         cb_out_mm,
                         Sq_chunk_t,
                         vDHt,
@@ -455,7 +459,9 @@ void MAIN {
                         false /*transpose*/,
                         false,
                         cb_mask_in,
-                        cb_zero_in);
+                        cb_zero_in,
+                        true,
+                        k_chunk_tiles_dynamic);
                 }
 
                 // Reconfig register DF
@@ -490,7 +496,7 @@ void MAIN {
                     pack_reconfig_data_format(cb_out_accumulate_im);
                     mul_block_bcast_cols(cb_out_accumulate_im, cb_exp_max_diff, cb_out_accumulate_im, Sq_chunk_t, vDHt);
 
-                    /* CUR_SUM += PREV_SUM */
+                    /* CUR_SUM = CUR_SUM + PREV_SUM */
                     reconfig_data_format(cb_cur_sum, cb_prev_sum);
                     pack_reconfig_data_format(cb_cur_sum);
                     add_block_inplace<true>(cb_cur_sum, cb_prev_sum, Sq_chunk_t);

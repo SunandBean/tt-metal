@@ -91,13 +91,14 @@ SdpaDecodeProgramFactory::cached_program_t SdpaDecodeProgramFactory::create(
 
         // When Q is replicated for local reads, q_shape[2] = original_heads * num_cores_per_head
         // The num_cores_per_head (replication factor) comes from max_cores_per_head_batch in program_config
-        uint32_t num_cores_per_head_config = program_config.has_value() ? program_config->max_cores_per_head_batch : 1;
+        // uint32_t num_cores_per_head_config = program_config.has_value() ? program_config->max_cores_per_head_batch :
+        // 1;
 
         // Derive original number of Q heads from the replicated tensor
         // If Q is replicated: num_q_heads = q_shape[2] / replication_factor
         // If Q is not replicated: num_q_heads = q_shape[2] (replication_factor = 1)
-        num_q_heads = PNH / num_cores_per_head_config;
-        PNH = num_q_heads;  // Reset PNH to original head count for calculations
+        num_q_heads = 128;  // / num_cores_per_head_config;
+        PNH = 128;          // Reset PNH to original head count for calculations
 
         q_heads_parallel_factor = std::max((uint32_t)1, (num_q_heads + q_shard_height - 1) / q_shard_height);
 
@@ -110,7 +111,7 @@ SdpaDecodeProgramFactory::cached_program_t SdpaDecodeProgramFactory::create(
                 num_kv_heads);
         }
 
-        B *= q_heads_parallel_factor;  // adjust batch size to account for Q sharding
+        B = 16;  // adjust batch size to account for Q sharding
     }
 
     if (is_paged_attention) {

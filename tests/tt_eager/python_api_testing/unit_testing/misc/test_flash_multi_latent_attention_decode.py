@@ -216,10 +216,9 @@ def run_flash_mla_decode_impl(
         # Reshape to (S, B, q_heads_parallel_factor, heads_per_vbatch, D)
         q_reshaped = q_permuted.reshape(1, batch, q_heads_parallel_factor, heads_per_vbatch, -1)  # (1, 4, 4, 32, 576)
         # Replicate each virtual batch chunk across num_cores_per_head
-        breakpoint()
         q_replicated = q_reshaped.repeat_interleave(num_cores_per_head, dim=2)  # (1, 4, 16, 32, 576)
         # Merge the replication into the heads dimension, preserving batch dim
-        q_for_tt = q_replicated.reshape(1, batch, -1, q_replicated.shape[-1])  # (1, 4, 512, 576)
+        q_for_tt = q_replicated.reshape(1, 1, -1, q_replicated.shape[-1])  # (1, 4, 512, 576)
     else:
         q_for_tt = q.permute(2, 0, 1, 3)  # Original path: (1, 4, 128, 576)
 
@@ -330,7 +329,7 @@ def run_flash_mla_decode_impl(
         layout=ttnn.TILE_LAYOUT,
         memory_config=q_mem_config,
     )
-    breakpoint()
+
     tt_k = ttnn.from_torch(
         tt_k_torch,
         device=device,
