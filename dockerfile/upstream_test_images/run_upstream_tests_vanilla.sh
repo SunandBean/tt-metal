@@ -94,7 +94,7 @@ test_suite_bh_multi_pcie_metal_unit_tests() {
     # https://tenstorrent.atlassian.net/browse/BH-84
     for i in {1..10}; do
         echo "Health check attempt $i"
-        if tt-smi -r >/dev/null 2>&1 && ./build/test/tt_metal/tt_fabric/test_system_health $min_connections_arg; then
+        if tt-smi -r >/dev/null 2>&1 && sleep 120 && ./build/test/tt_metal/tt_fabric/test_system_health $min_connections_arg; then
             echo "Health checks passed"
             break
         fi
