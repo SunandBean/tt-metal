@@ -134,18 +134,33 @@ struct MulticastRoutingCommandHeader {
 static_assert(
     sizeof(MulticastRoutingCommandHeader) <= sizeof(RoutingFields), "MulticastRoutingCommandHeader size is not 1 byte");
 
+// Helper to extract maximum number of hops from LowLatencyPacketHeaderT
+// The other helpers are defined further down in this file, after their respective template declarations
+template <typename HEADER_TYPE>
+struct get_max_num_hops {
+    // Use std::is_same_v to ensure this static_assert is only evaluated after template instantiation
+    static_assert(!std::is_same_v<HEADER_TYPE, HEADER_TYPE>, "Unsupported header type in get_max_num_hops");
+};
+
+template <typename HEADER_TYPE>
 struct SparseMulticastRoutingCommandHeader {
     // Each bit represents a single hop in the target direction
-    // Up to 16 hops can be specified in the bitmask.
     // The router will WRITE AND FORWARD at hops set to 1 and FORWARD ONLY at unset hops.
     // This continues until the last set bit, which will WRITE ONLY and not forward the packet any further.
     // For example, if we want to write from device 0 to devices 1 and 4 only:
     // 0 --> 1 --> 2 --> 3 --> 4 --- 5
     //      [X]               [X]
     // We would set a hop mask of 0b01001
-    uint16_t hop_mask;
+
+    static constexpr uint32_t max_num_hops = get_max_num_hops<HEADER_TYPE>::value;
+
+    using HopMaskType = std::conditional_t<
+        max_num_hops <= 8,
+        uint8_t,
+        std::conditional_t<max_num_hops <= 16, uint16_t, std::conditional_t<max_num_hops <= 32, uint32_t, uint64_t>>>;
+
+    HopMaskType hop_mask;
 };
-// Add static assert?
 
 struct NocUnicastCommandHeader {
     uint64_t noc_address;
@@ -348,7 +363,8 @@ public:
     }
 
     // NOTE: Currently only defined for 1D LowLatency packet headers
-    Derived& to_chip_sparse_multicast(const SparseMulticastRoutingCommandHeader& sparse_mcast_routing_command_header) {
+    Derived& to_chip_sparse_multicast(
+        const SparseMulticastRoutingCommandHeader<Derived>& sparse_mcast_routing_command_header) {
         static_cast<Derived*>(this)->to_chip_sparse_multicast_impl(sparse_mcast_routing_command_header);
         return *static_cast<Derived*>(this);
     }
@@ -464,8 +480,11 @@ public:
     }
 
     // NOTE: Currently only defined for 1D LowLatency packet headers
+    // To use this function, use SparseMulticastRoutingCommandHeader<PACKET_HEADER_TYPE> as the parameter type for the
+    // header PACKET_HEADER_TYPE is defined at the end of this file automatically, depending on the selected routing and
+    // topology
     volatile Derived* to_chip_sparse_multicast(
-        const SparseMulticastRoutingCommandHeader& sparse_mcast_routing_command_header) volatile {
+        const SparseMulticastRoutingCommandHeader<Derived>& sparse_mcast_routing_command_header) volatile {
         static_cast<volatile Derived*>(this)->to_chip_sparse_multicast_impl(sparse_mcast_routing_command_header);
         return static_cast<volatile Derived*>(this);
     }
@@ -706,6 +725,13 @@ public:
     }
 };
 
+// Used to get the maximum number of hops that this packet header can support
+template <>
+struct get_max_num_hops<PacketHeader> {
+    static constexpr uint32_t value = ((1 << RoutingFields::START_DISTANCE_FIELD_BIT_WIDTH) - 1) +
+                                      ((1 << RoutingFields::RANGE_HOPS_FIELD_BIT_WIDTH) - 1);
+};
+
 // Primary template for 1D routing fields with route buffer (ExtensionWords >= 1)
 template <uint32_t ExtensionWords = 1>
 struct LowLatencyRoutingFieldsT {
@@ -779,6 +805,18 @@ struct LowLatencyRoutingFieldsT<0> {
     }
 } __attribute__((packed));
 
+// Temporary template function used to restrict sparse multicast to 1D LowLatency Packet headers with ExtensionWords = 0
+// Sparse multicast has not yet been implemented for ExtensionWords > 0
+template <uint32_t ExtensionWords>
+struct is_sparse_multicast_supported {
+    static constexpr bool value = false;
+};
+
+template <>
+struct is_sparse_multicast_supported<0> {
+    static constexpr bool value = true;
+};
+
 // Template for 1D packet headers with variable routing field sizes
 template <uint32_t ExtensionWords = 0>
 struct LowLatencyPacketHeaderT : public PacketHeaderBase<LowLatencyPacketHeaderT<ExtensionWords>> {
@@ -801,6 +839,13 @@ private:
     }
 
     static constexpr size_t padding_size() { return target_size() - unpadded_size(); }
+
+    // Type alias for Sparse Multicast Routing Command Header
+    // To use the Sparse Multicast Functions (eg. to_chip_sparse_multicast), use
+    // SparseMulticastRoutingCommandHeader<PACKET_HEADER_TYPE> as the parameter type PACKET_HEADER_TYPE is defined at
+    // the end of this file automatically
+    using SPARSE_MCAST_ROUTING_CMD_HDR_TYPE =
+        SparseMulticastRoutingCommandHeader<LowLatencyPacketHeaderT<ExtensionWords>>;
 
 public:
     // Explicit padding to reach target size
@@ -839,9 +884,13 @@ public:
 
     // Helper to calculate routing fields for sparse multicast
     static LowLatencyRoutingFieldsT<ExtensionWords> calculate_chip_sparse_multicast_routing_fields(
-        const SparseMulticastRoutingCommandHeader& chip_sparse_multicast_command_header) {
+        const SPARSE_MCAST_ROUTING_CMD_HDR_TYPE& chip_sparse_multicast_command_header) {
         // Delegate to canonical encoder
-        // We currently only support a base packet header, not extension words
+        // We currently only support a base packet header, not extension words.
+        static_assert(
+            is_sparse_multicast_supported<ExtensionWords>::value,
+            "Sparse multicast is currently only supported for ExtensionWords = 0");
+
         uint32_t buffer;
         routing_encoding::encode_1d_sparse_multicast(chip_sparse_multicast_command_header.hop_mask, buffer);
         // Unpack using helper
@@ -857,8 +906,7 @@ public:
     void to_chip_multicast_impl(const MulticastRoutingCommandHeader& chip_multicast_command_header) {
         this->routing_fields = calculate_chip_multicast_routing_fields(chip_multicast_command_header);
     }
-    void to_chip_sparse_multicast_impl(
-        const SparseMulticastRoutingCommandHeader& chip_sparse_multicast_command_header) {
+    void to_chip_sparse_multicast_impl(const SPARSE_MCAST_ROUTING_CMD_HDR_TYPE& chip_sparse_multicast_command_header) {
         this->routing_fields = calculate_chip_sparse_multicast_routing_fields(chip_sparse_multicast_command_header);
     }
 
@@ -871,7 +919,7 @@ public:
         routing.copy_to(&this->routing_fields);
     }
     void to_chip_sparse_multicast_impl(
-        const SparseMulticastRoutingCommandHeader& chip_sparse_multicast_command_header) volatile {
+        const SPARSE_MCAST_ROUTING_CMD_HDR_TYPE& chip_sparse_multicast_command_header) volatile {
         auto routing = calculate_chip_sparse_multicast_routing_fields(chip_sparse_multicast_command_header);
         routing.copy_to(&this->routing_fields);
     }
@@ -880,6 +928,12 @@ public:
 // Validate expected sizes with detailed checks
 static_assert(sizeof(LowLatencyPacketHeaderT<0>) == 48, "16-hop total must be 48B");
 static_assert(sizeof(LowLatencyPacketHeaderT<1>) == 64, "32-hop total must be 64B");
+
+// Used to get the maximum number of hops that this packet header can support
+template <uint32_t ExtensionWords>
+struct get_max_num_hops<LowLatencyPacketHeaderT<ExtensionWords>> {
+    static constexpr uint32_t value = LowLatencyRoutingFieldsT<ExtensionWords>::MAX_NUM_ENCODINGS;
+};
 
 // Conditional type selection based on injected define
 #ifndef FABRIC_1D_PKT_HDR_EXTENSION_WORDS
@@ -945,6 +999,13 @@ struct HybridMeshPacketHeaderT : PacketHeaderBase<HybridMeshPacketHeaderT<RouteB
 static_assert(sizeof(HybridMeshPacketHeaderT<19>) == 80, "19B buffer must result in 80B header (max capacity)");
 static_assert(sizeof(HybridMeshPacketHeaderT<35>) == 96, "35B buffer must result in 96B header (max capacity)");
 
+// Used to get the maximum number of hops that this packet header can support
+template <int RouteBufferSize>
+struct get_max_num_hops<HybridMeshPacketHeaderT<RouteBufferSize>> {
+    // Each byte in the packet header's route buffer represents a single hop
+    static constexpr uint32_t value = static_cast<uint32_t>(RouteBufferSize);
+};
+
 // Conditional type selection based on injected define
 #ifdef FABRIC_2D_PKT_HDR_ROUTE_BUFFER_SIZE
 using HybridMeshPacketHeader = HybridMeshPacketHeaderT<FABRIC_2D_PKT_HDR_ROUTE_BUFFER_SIZE>;
@@ -968,6 +1029,12 @@ static_assert(
 
 // TODO: When we remove the 32B padding requirement, reduce to 16B size check
 static_assert(sizeof(PacketHeader) == 64, "sizeof(PacketHeader) is not equal to 64B");
+
+// Used to get the maximum number of hops that this packet header can support
+template <>
+struct get_max_num_hops<UDMHybridMeshPacketHeader> {
+    static constexpr uint32_t value = get_max_num_hops<HybridMeshPacketHeader>::value;
+};
 
 #define STRINGIFY(x) #x
 #define TOSTRING(x) STRINGIFY(x)
