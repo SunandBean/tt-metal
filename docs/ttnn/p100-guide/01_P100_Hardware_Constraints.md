@@ -16,19 +16,33 @@ P100은 Tenstorrent **Blackhole** 아키텍처 기반의 싱글 카드 가속기
 | **컴퓨트 코어** | 140개 | 140개 | 80개 |
 | **코어 그리드** | 17x12 | 17x12 | 10x12 |
 | **L1/코어** | 1,536 KB | 1,536 KB | 1,464 KB |
-| **DRAM 코어** | **7개** | **8개** | 12개 |
-| **총 DRAM** | ~32 GB | ~32 GB | ~12 GB |
+| **DRAM 뱅크** | **7개** (1개 하베스트) | **8개** | 12개 |
+| **총 DRAM** | **~28 GB** (7 × 4GB) | ~32 GB (8 × 4GB) | ~12 GB |
 | **이더넷** | 비활성(harvested) | 활성 | 활성 |
 | **멀티디바이스** | 불가 | 가능 | 가능 |
 
 ## P100 vs P150: 핵심 차이점
 
-**P100과 P150은 동일한 Blackhole 칩이지만, 딱 두 가지가 다릅니다:**
+**P100과 P150은 동일한 Blackhole 칩이지만 핵심 차이가 있습니다:**
 
-1. **DRAM 코어: 7개 vs 8개** - 이것이 대부분의 문제의 근원
-2. **이더넷: 비활성 vs 활성** - 싱글 디바이스만 가능
+1. **DRAM 뱅크: 7개 vs 8개** → 총 DRAM **28GB vs 32GB**, matmul per_core_N 계산이 달라짐
+2. **이더넷: 비활성 vs 활성** → 싱글 디바이스만 가능
 
-### DRAM 코어 7개의 영향
+### DRAM 하베스팅 상세
+
+```cpp
+// tools/scaleout/factory_system_descriptor/utils.cpp:867-868
+if (board_type_enum == BoardType::P100) {
+    dram_harvesting_mask = 8;  // binary 0b1000 → 1개 DRAM 뱅크 비활성화
+}
+
+// blackhole dev_mem_map.h:39
+#define MEM_DRAM_SIZE (4177920 * 1024U)  // 뱅크당 ~3.99 GB
+// P100: 7 뱅크 × ~4 GB = ~28 GB
+// P150: 8 뱅크 × ~4 GB = ~32 GB
+```
+
+### DRAM 뱅크 7개의 영향
 
 DRAM-sharded matmul에서 `per_core_N` 계산이 모두 달라집니다:
 
