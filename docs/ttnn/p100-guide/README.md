@@ -13,6 +13,7 @@ Tenstorrent P100 디바이스에서 Llama 3.1 8B, Whisper, VLM을 실행하기 �
 | 05 | [VLM on P100](05_VLM_on_P100.md) | 구현된 VLM 목록, 적합한 모델, 포팅 가이드 |
 | 06 | [액션 플랜 요약](06_Action_Plan_Summary.md) | 수정 우선순위, 핵심 파일, 검증 체크리스트 |
 | 07 | [Inference Server (vLLM) L1 오버플로](07_Inference_Server_L1_Overflow.md) | 데모 vs 서버 차이, device_params 문제, 해결 방안 |
+| 08 | [작업 플랜 (실행 가이드)](08_Work_Plan.md) | Phase 1-6 단계별 실행 가이드, 수정 파일/라인, 성공 기준 |
 
 ## 핵심 요약
 
